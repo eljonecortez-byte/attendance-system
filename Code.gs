@@ -41,7 +41,8 @@ const HEADERS = {
     'Landowner ID', 'Landowner Name', 'Location ID', 'Work Location', 'Attendance Date',
     'Time IN', 'Time OUT', 'Original Time IN', 'Original Time OUT', 'Adjusted By',
     'Adjustment Reason', 'Actual GPS IN', 'Actual GPS OUT', 'Device Timestamp',
-    'Synchronization Date', 'Synchronization Status', 'Record Status'
+    'Synchronization Date', 'Synchronization Status', 'Record Status',
+    'Attendance Type', 'Leave Type', 'Leave Remarks'
   ],
   AUDIT_LOGS: [
     'Log ID', 'User ID', 'User Role', 'Action', 'Record ID',
@@ -167,6 +168,22 @@ function setupDatabase() {
     }
   }
 
+  // MIGRATION: add any new Attendance columns (Attendance Type, Leave Type, Leave Remarks)
+  // to an existing sheet without touching the existing data.
+  var attSheet = ss.getSheetByName(SHEET_NAMES.ATTENDANCE);
+  var neededHeaders = HEADERS.ATTENDANCE;
+  var currentHeaders = attSheet.getRange(1, 1, 1, Math.max(attSheet.getLastColumn(), neededHeaders.length)).getValues()[0];
+  for (var h = 0; h < neededHeaders.length; h++) {
+    if (!currentHeaders[h]) {
+      var hc = attSheet.getRange(1, h + 1);
+      hc.setValue(neededHeaders[h]);
+      hc.setBackground('#15803d');
+      hc.setFontColor('#ffffff');
+      hc.setFontWeight('bold');
+      attSheet.setColumnWidth(h + 1, 160);
+    }
+  }
+
   // Ensure default Admin user exists in Users sheet
   var userSheet = ss.getSheetByName(SHEET_NAMES.USERS);
   if (userSheet.getLastRow() <= 1) {
@@ -257,7 +274,9 @@ function handleGetInitialData(payload) {
   function getSheetObjects(sheetName) {
     var sheet = ss.getSheetByName(sheetName);
     if (!sheet || sheet.getLastRow() <= 1) return [];
-    var data = sheet.getDataRange().getValues();
+    var range = sheet.getDataRange();
+    var data = range.getValues();
+    var display = range.getDisplayValues();
     var headers = data[0];
     var rows = [];
     for (var r = 1; r < data.length; r++) {
@@ -265,7 +284,7 @@ function handleGetInitialData(payload) {
       var obj = {};
       for (var c = 0; c < headers.length; c++) {
         var key = toCamelCase(headers[c]);
-        obj[key] = row[c];
+        obj[key] = normalizeCell(key, row[c], display[r][c]);
       }
       rows.push(obj);
     }
@@ -323,6 +342,28 @@ function handleGetInitialData(payload) {
 }
 
 /**
+ * Google Sheets silently converts text such as "2026-10-26", "07:01 AM" or "0001"
+ * into Date / number values. Convert them back so the app always receives
+ * plain strings (yyyy-MM-dd dates, "hh:mm AM" times, text IDs).
+ */
+function normalizeCell(key, v, displayValue) {
+  if (v instanceof Date) {
+    var tz = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
+    if (key === 'attendanceDate' || key === 'dateEnrolled') {
+      return Utilities.formatDate(v, tz, 'yyyy-MM-dd');
+    }
+    if (/^(time|originalTime)/.test(key)) {
+      return (displayValue || '').replace(/(\d{1,2}:\d{2}):\d{2}(\s*[AaPp][Mm])/, '$1$2').replace(/^(\d):/, '0$1:');
+    }
+    return v.toISOString();
+  }
+  if (typeof v === 'number' && /Id$/.test(key)) {
+    return String(v);
+  }
+  return v;
+}
+
+/**
  * Synchronize Attendance Batch: Upsert logic to prevent duplicate records
  */
 function handleSyncAttendanceBatch(payload) {
@@ -347,6 +388,7 @@ function handleSyncAttendanceBatch(payload) {
 
   var syncedIds = [];
   var now = new Date().toISOString();
+  var nextRow = sheet.getLastRow() + 1;
 
   records.forEach(function(rec) {
     var recId = rec.attendanceRecordId;
@@ -372,21 +414,37 @@ function handleSyncAttendanceBatch(payload) {
       rec.deviceTimestamp || now,
       now, // Synchronization Date
       'SYNCED',
-      rec.recordStatus || 'ACTIVE'
+      rec.recordStatus || 'ACTIVE',
+      rec.attendanceType || 'PRESENT',
+      rec.leaveType || '',
+      rec.leaveRemarks || ''
     ];
+
+    var isLeave = (rec.attendanceType || '').toUpperCase() === 'LEAVE';
 
     if (recordMap[recId]) {
       // Record already exists: Update existing row (Preserves ID & avoids duplicates)
       var rowIndex = recordMap[recId];
-      sheet.getRange(rowIndex, 1, 1, rowValues.length).setValues([rowValues]);
+      var rowRange = sheet.getRange(rowIndex, 1, 1, rowValues.length);
+      rowRange.setNumberFormat('@'); // plain text: keeps dates, times and IDs like 0001 exactly as sent
+      rowRange.setValues([rowValues]);
 
-      if (rec.adjustmentReason) {
+      if (isLeave && rec.recordStatus === 'DELETED') {
+        logAudit(userId, userRole, 'CANCEL_LEAVE', recId, (rec.leaveType || 'Leave') + ' ' + rec.attendanceDate, 'DELETED', rec.employeeName);
+      } else if (rec.adjustmentReason) {
         logAudit(userId, userRole, 'UPDATE_ATTENDANCE', recId, 'Previous Record', JSON.stringify(rec), rec.adjustmentReason);
       }
     } else {
-      // New record: Append row
-      sheet.appendRow(rowValues);
-      recordMap[recId] = sheet.getLastRow();
+      // New record: write into the next empty row as plain text
+      var newRange = sheet.getRange(nextRow, 1, 1, rowValues.length);
+      newRange.setNumberFormat('@');
+      newRange.setValues([rowValues]);
+      recordMap[recId] = nextRow;
+      nextRow++;
+
+      if (isLeave) {
+        logAudit(userId, userRole, 'RECORD_LEAVE', recId, '', (rec.leaveType || 'Leave') + ' - ' + rec.employeeName + ' - ' + rec.attendanceDate, rec.leaveRemarks || '');
+      }
     }
 
     syncedIds.push(recId);
