@@ -243,6 +243,65 @@
     </div>
   </div>
 
+  <!-- Mark On Leave Modal -->
+  <div id="leave-modal" class="modal-overlay">
+    <div class="modal-container">
+      <div class="modal-header">
+        <h3 class="modal-title">🏖 Mark Employee On Leave</h3>
+        <button class="modal-close" onclick="app.closeModal('leave-modal')">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div id="leave-modal-emp" style="background: var(--bg-page); padding: 12px; border-radius: var(--radius-sm); margin-bottom: 16px;"></div>
+
+        <div class="form-group">
+          <label class="form-label required">Leave Type</label>
+          <select id="leave-type" class="form-control">
+            <option>Sick Leave</option>
+            <option>Vacation Leave</option>
+            <option>Emergency Leave</option>
+            <option>Personal Leave</option>
+            <option>Other</option>
+          </select>
+        </div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label class="form-label required">From Date</label>
+            <input type="date" id="leave-from" class="form-control" />
+          </div>
+          <div class="form-group">
+            <label class="form-label">To Date <small style="font-weight: normal; color: var(--text-muted);">(optional)</small></label>
+            <input type="date" id="leave-to" class="form-control" />
+          </div>
+        </div>
+        <div class="form-helper" style="margin: -6px 0 14px;">Leave "To Date" empty for a one-day leave. A separate leave record is created for each day (up to 31 days).</div>
+
+        <div class="form-group">
+          <label class="form-label">Remarks</label>
+          <textarea id="leave-remarks" class="form-control" rows="2" placeholder="e.g. Fever, with medical certificate"></textarea>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-outline" onclick="app.closeModal('leave-modal')">Cancel</button>
+        <button type="button" class="btn btn-primary" onclick="app.saveLeave()">Save Leave</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Supervisor Team Detail Modal (Admin Dashboard) -->
+  <div id="sup-detail-modal" class="modal-overlay">
+    <div class="modal-container">
+      <div class="modal-header">
+        <h3 class="modal-title" id="sup-detail-title">Team</h3>
+        <button class="modal-close" onclick="app.closeModal('sup-detail-modal')">&times;</button>
+      </div>
+      <div class="modal-body" id="sup-detail-body"></div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-outline" onclick="app.closeModal('sup-detail-modal')">Close</button>
+      </div>
+    </div>
+  </div>
+
   <!-- 4. TOAST NOTIFICATIONS CONTAINER -->
   <div id="toast-container"></div>
 
