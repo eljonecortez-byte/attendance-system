@@ -1,0 +1,2539 @@
+/**
+ * MAIN APPLICATION CONTROLLER
+ * Employee Attendance Monitoring System
+ */
+
+class AttendanceApp {
+  constructor() {
+    this.currentView = 'dashboard';
+    this.activeGps = { coords: '', accuracy: null, status: 'Checking...' };
+    this.selectedSyncIds = new Set();
+    this.currentEditEmployee = null;
+    this.currentAdjustRecord = null;
+    this.sessionLandowner = null; // Active Landowner for area checking { id, name, workLocation }
+  }
+
+  async init() {
+    console.log('[App] Initializing application...');
+
+    // Initialize Database
+    await db.init();
+
+    // Check existing session
+    const user = await auth.initSession();
+    this.sessionLandowner = await db.getSetting('sessionLandowner', null);
+
+    // Register Service Worker
+    this.registerServiceWorker();
+
+    // Start background GPS tracker
+    this.initGpsTracking();
+
+    // Bind event listeners
+    this.bindEvents();
+
+    // Subscribe to Sync updates
+    syncService.subscribe((event) => this.handleSyncEvent(event));
+
+    // Update connection badge
+    this.updateNetworkBadge();
+
+    // Route to appropriate view
+    if (user) {
+      this.renderAppShell();
+      this.navigateTo('dashboard');
+      // If online, sync pending or pull latest data in background
+      if (navigator.onLine) {
+        syncService.autoSync();
+      }
+    } else {
+      this.showLoginView();
+    }
+  }
+
+  // Register Service Worker for PWA & Offline Support
+  registerServiceWorker() {
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('./sw.js')
+        .then((reg) => console.log('[SW] Service Worker registered. Scope:', reg.scope))
+        .catch((err) => console.warn('[SW] Service Worker registration failed:', err));
+    }
+  }
+
+  // GPS Acquisition
+  async initGpsTracking() {
+    if (!navigator.geolocation) {
+      this.activeGps = { coords: '', accuracy: null, status: 'Not Supported' };
+      this.renderGpsPill();
+      return;
+    }
+
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        const lat = pos.coords.latitude.toFixed(6);
+        const lng = pos.coords.longitude.toFixed(6);
+        const acc = Math.round(pos.coords.accuracy);
+        this.activeGps = { coords: `${lat}, ${lng}`, accuracy: acc, status: 'Acquired' };
+        this.renderGpsPill();
+      },
+      (err) => {
+        this.activeGps = { coords: '', accuracy: null, status: 'Permission Denied / Off' };
+        this.renderGpsPill();
+      },
+      { enableHighAccuracy: true, timeout: 8000, maximumAge: 30000 }
+    );
+  }
+
+  renderGpsPill() {
+    const pill = document.getElementById('gps-status-pill');
+    if (!pill) return;
+    if (this.activeGps.coords) {
+      pill.className = 'gps-pill gps-active';
+      pill.innerHTML = `
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M12 2a8 8 0 0 0-8 8c0 5.25 8 12 8 12s8-6.75 8-12a8 8 0 0 0-8-8z"/>
+          <circle cx="12" cy="10" r="3"/>
+        </svg>
+        <span>GPS: ${this.activeGps.coords} (±${this.activeGps.accuracy}m)</span>
+      `;
+    } else {
+      pill.className = 'gps-pill';
+      pill.innerHTML = `
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="10"/>
+          <line x1="12" y1="8" x2="12" y2="12"/>
+          <line x1="12" y1="16" x2="12.01" y2="16"/>
+        </svg>
+        <span>GPS: ${this.activeGps.status}</span>
+      `;
+    }
+  }
+
+  updateNetworkBadge() {
+    const isOnline = navigator.onLine;
+    const badge = document.getElementById('network-status-badge');
+    if (!badge) return;
+
+    if (isOnline) {
+      badge.className = 'status-pill status-online';
+      badge.innerHTML = '<span class="status-dot"></span> Online';
+    } else {
+      badge.className = 'status-pill status-offline';
+      badge.innerHTML = '<span class="status-dot"></span> Offline';
+    }
+  }
+
+  handleSyncEvent(event) {
+    if (event.type === 'NETWORK_CHANGE') {
+      this.updateNetworkBadge();
+      if (event.isOnline) {
+        this.showToast('Internet connection restored. Synchronizing...', 'info');
+      } else {
+        this.showToast('You are offline. Attendance will be saved locally.', 'warning');
+      }
+    } else if (event.type === 'SYNC_COMPLETE') {
+      this.showToast(event.count > 0 ? `Synchronized ${event.count} records!` : 'Database is up to date.', 'success');
+      this.refreshCurrentView();
+    } else if (event.type === 'SYNC_ERROR') {
+      this.showToast(`Sync issue: ${event.error}`, 'error');
+      this.refreshCurrentView();
+    } else if (event.type === 'DATA_PULLED') {
+      this.refreshCurrentView();
+    }
+  }
+
+  // Toast Notification Manager
+  showToast(message, type = 'info') {
+    const container = document.getElementById('toast-container');
+    if (!container) return;
+
+    const toast = document.createElement('div');
+    toast.className = `toast toast-${type}`;
+
+    let iconSvg = '';
+    if (type === 'success') {
+      iconSvg = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#16a34a" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>`;
+    } else if (type === 'error') {
+      iconSvg = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#ef4444" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>`;
+    } else if (type === 'warning') {
+      iconSvg = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>`;
+    } else {
+      iconSvg = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#2563eb" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>`;
+    }
+
+    toast.innerHTML = `
+      ${iconSvg}
+      <div style="flex: 1; word-break: break-word;">${message}</div>
+    `;
+
+    container.appendChild(toast);
+    setTimeout(() => {
+      toast.style.opacity = '0';
+      toast.style.transition = 'opacity 0.3s ease';
+      setTimeout(() => toast.remove(), 300);
+    }, 4000);
+  }
+
+  // Bind Global UI Events
+  bindEvents() {
+    // Mobile Sidebar toggle
+    const toggleBtn = document.getElementById('sidebar-toggle');
+    const sidebar = document.getElementById('sidebar');
+    if (toggleBtn && sidebar) {
+      toggleBtn.addEventListener('click', () => sidebar.classList.toggle('open'));
+    }
+
+    // Close sidebar when clicking outside on mobile
+    document.addEventListener('click', (e) => {
+      if (sidebar && sidebar.classList.contains('open') && !sidebar.contains(e.target) && !toggleBtn.contains(e.target)) {
+        sidebar.classList.remove('open');
+      }
+    });
+
+    // Logout
+    const logoutBtn = document.getElementById('logout-btn');
+    if (logoutBtn) {
+      logoutBtn.addEventListener('click', async () => {
+        await auth.logout();
+        this.showLoginView();
+      });
+    }
+
+    // Settings Modal
+    const settingsBtn = document.getElementById('settings-btn');
+    if (settingsBtn) {
+      settingsBtn.addEventListener('click', () => this.openSettingsModal());
+    }
+
+    // Sync button in header
+    const quickSyncBtn = document.getElementById('quick-sync-btn');
+    if (quickSyncBtn) {
+      quickSyncBtn.addEventListener('click', async () => {
+        try {
+          quickSyncBtn.disabled = true;
+          this.showToast('Starting synchronization...', 'info');
+          await syncService.syncAllPending();
+        } catch (err) {
+          this.showToast(err.message, 'error');
+        } finally {
+          quickSyncBtn.disabled = false;
+        }
+      });
+    }
+  }
+
+  showLoginView() {
+    document.getElementById('app-layout').style.display = 'none';
+    document.getElementById('login-view-wrapper').style.display = 'flex';
+    this.renderLoginForm();
+  }
+
+  renderAppShell() {
+    document.getElementById('login-view-wrapper').style.display = 'none';
+    document.getElementById('app-layout').style.display = 'flex';
+
+    const user = auth.getCurrentUser();
+    if (!user) return;
+
+    // Update user info in sidebar
+    const userNameEl = document.getElementById('user-display-name');
+    const userRoleEl = document.getElementById('user-display-role');
+    const userAvatarEl = document.getElementById('user-display-avatar');
+
+    if (userNameEl) userNameEl.textContent = user.name || user.username;
+    if (userRoleEl) userRoleEl.textContent = `${user.role} ${user.isOfflineSession ? '(Offline)' : ''}`;
+    if (userAvatarEl) userAvatarEl.textContent = (user.name || user.username).charAt(0).toUpperCase();
+
+    // Render navigation links based on Role
+    this.renderNavigation();
+    this.renderGpsPill();
+    this.updateNetworkBadge();
+
+    // Update active landowner pill for supervisor area checking
+    const sessionLandownerPill = document.getElementById('session-landowner-pill');
+    const sessionLandownerNameDisplay = document.getElementById('session-landowner-name-display');
+    if (sessionLandownerPill) {
+      if (auth.isSupervisor()) {
+        sessionLandownerPill.style.display = 'inline-flex';
+        if (sessionLandownerNameDisplay) {
+          sessionLandownerNameDisplay.textContent = this.sessionLandowner ? `Area: ${this.sessionLandowner.name}` : 'Area: Select Landowner';
+        }
+      } else {
+        sessionLandownerPill.style.display = 'none';
+      }
+    }
+  }
+
+  // Active Landowner Modal for Supervisor Area Checking
+  async promptSelectSessionLandowner() {
+    const modal = document.getElementById('landowner-session-modal');
+    const select = document.getElementById('modal-landowner-select');
+    const customInput = document.getElementById('modal-landowner-custom');
+    const locInput = document.getElementById('modal-landowner-location');
+    if (!modal || !select) return;
+
+    // Load enrolled landowners
+    const landowners = await db.getAll('landowners');
+    select.innerHTML = '<option value="">-- Choose from Enrolled Landowners --</option>';
+    landowners.forEach((l) => {
+      const opt = document.createElement('option');
+      opt.value = l.landownerName;
+      opt.dataset.id = l.landownerId;
+      opt.dataset.location = l.workLocation || '';
+      opt.textContent = `${l.landownerName}${l.workLocation ? ' (' + l.workLocation + ')' : ''}`;
+      if (this.sessionLandowner && this.sessionLandowner.name === l.landownerName) {
+        opt.selected = true;
+      }
+      select.appendChild(opt);
+    });
+
+    if (customInput) customInput.value = (this.sessionLandowner && !landowners.some((l) => l.landownerName === this.sessionLandowner.name)) ? this.sessionLandowner.name : '';
+    if (locInput) locInput.value = this.sessionLandowner ? (this.sessionLandowner.workLocation || '') : '';
+
+    this.openModal('landowner-session-modal');
+  }
+
+  onModalLandownerSelectChange() {
+    const select = document.getElementById('modal-landowner-select');
+    const locInput = document.getElementById('modal-landowner-location');
+    const customInput = document.getElementById('modal-landowner-custom');
+    const selectedOpt = select.options[select.selectedIndex];
+    if (selectedOpt && selectedOpt.value) {
+      if (locInput && selectedOpt.dataset.location) {
+        locInput.value = selectedOpt.dataset.location;
+      }
+      if (customInput) customInput.value = '';
+    }
+  }
+
+  async saveSessionLandownerFromModal() {
+    const select = document.getElementById('modal-landowner-select');
+    const customInput = document.getElementById('modal-landowner-custom');
+    const locInput = document.getElementById('modal-landowner-location');
+
+    let lndName = '';
+    let lndId = '';
+    let workLoc = locInput ? locInput.value.trim() : '';
+
+    const selectedOpt = select.options[select.selectedIndex];
+    if (customInput && customInput.value.trim()) {
+      lndName = customInput.value.trim();
+      lndId = `LND-CUST-${Date.now()}`;
+    } else if (selectedOpt && selectedOpt.value) {
+      lndName = selectedOpt.value;
+      lndId = selectedOpt.dataset.id || '';
+      if (!workLoc && selectedOpt.dataset.location) {
+        workLoc = selectedOpt.dataset.location;
+      }
+    }
+
+    if (!lndName) {
+      alert('Please select or enter a Landowner name for area checking.');
+      return;
+    }
+
+    const landownerObj = {
+      id: lndId,
+      name: lndName,
+      workLocation: workLoc
+    };
+
+    this.sessionLandowner = landownerObj;
+    await db.setSetting('sessionLandowner', landownerObj);
+
+    this.closeModal('landowner-session-modal');
+    this.showToast(`Area Checking Landowner set to: ${lndName}`, 'success');
+    this.renderAppShell();
+    this.refreshCurrentView();
+  }
+
+  renderNavigation() {
+    const nav = document.getElementById('sidebar-nav-links');
+    const bottomNav = document.getElementById('bottom-nav');
+    if (!nav) return;
+
+    const isAdmin = auth.isAdmin();
+
+    let linksHtml = `
+      <div class="nav-section-title">Main</div>
+      <div class="nav-item ${this.currentView === 'dashboard' ? 'active' : ''}" onclick="app.navigateTo('dashboard')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+        <span>Dashboard</span>
+      </div>
+      <div class="nav-item ${this.currentView === 'attendance' ? 'active' : ''}" onclick="app.navigateTo('attendance')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+        <span>Record Attendance</span>
+      </div>
+      <div class="nav-item ${this.currentView === 'history' ? 'active' : ''}" onclick="app.navigateTo('history')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+        <span>Attendance History</span>
+      </div>
+      <div class="nav-item ${this.currentView === 'sync' ? 'active' : ''}" onclick="app.navigateTo('sync')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+        <span>Sync Dashboard</span>
+      </div>
+    `;
+
+    if (isAdmin) {
+      linksHtml += `
+        <div class="nav-section-title">Administration</div>
+        <div class="nav-item ${this.currentView === 'employees' ? 'active' : ''}" onclick="app.navigateTo('employees')">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+          <span>Employees</span>
+        </div>
+        <div class="nav-item ${this.currentView === 'supervisors' ? 'active' : ''}" onclick="app.navigateTo('supervisors')">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+          <span>Supervisors</span>
+        </div>
+        <div class="nav-item ${this.currentView === 'landowners' ? 'active' : ''}" onclick="app.navigateTo('landowners')">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
+          <span>Landowners</span>
+        </div>
+        <div class="nav-item ${this.currentView === 'locations' ? 'active' : ''}" onclick="app.navigateTo('locations')">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg>
+          <span>Work Locations</span>
+        </div>
+        <div class="nav-item ${this.currentView === 'users' ? 'active' : ''}" onclick="app.navigateTo('users')">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+          <span>User Accounts</span>
+        </div>
+        <div class="nav-item ${this.currentView === 'audit' ? 'active' : ''}" onclick="app.navigateTo('audit')">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
+          <span>Audit Logs</span>
+        </div>
+      `;
+    }
+
+    nav.innerHTML = linksHtml;
+
+    // Mobile Bottom Nav
+    if (bottomNav) {
+      bottomNav.innerHTML = `
+        <div class="bottom-nav-item ${this.currentView === 'dashboard' ? 'active' : ''}" onclick="app.navigateTo('dashboard')">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+          <span>Home</span>
+        </div>
+        <div class="bottom-nav-item ${this.currentView === 'attendance' ? 'active' : ''}" onclick="app.navigateTo('attendance')">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+          <span>Record</span>
+        </div>
+        <div class="bottom-nav-item ${this.currentView === 'history' ? 'active' : ''}" onclick="app.navigateTo('history')">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+          <span>History</span>
+        </div>
+        <div class="bottom-nav-item ${this.currentView === 'sync' ? 'active' : ''}" onclick="app.navigateTo('sync')">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+          <span>Sync</span>
+        </div>
+      `;
+    }
+  }
+
+  navigateTo(viewName) {
+    this.currentView = viewName;
+    const sidebar = document.getElementById('sidebar');
+    if (sidebar && sidebar.classList.contains('open')) {
+      sidebar.classList.remove('open');
+    }
+
+    this.renderNavigation();
+    this.renderCurrentView();
+  }
+
+  refreshCurrentView() {
+    this.renderCurrentView();
+  }
+
+  renderCurrentView() {
+    const container = document.getElementById('view-content-root');
+    const titleEl = document.getElementById('page-title-text');
+    if (!container) return;
+
+    switch (this.currentView) {
+      case 'dashboard':
+        if (titleEl) titleEl.textContent = auth.isAdmin() ? 'Administrator Dashboard' : 'Supervisor Dashboard';
+        this.renderDashboard(container);
+        break;
+
+      case 'attendance':
+        if (titleEl) titleEl.textContent = 'Record Attendance (Time IN / OUT)';
+        this.renderAttendanceRecording(container);
+        break;
+
+      case 'history':
+        if (titleEl) titleEl.textContent = 'Attendance History';
+        this.renderHistory(container);
+        break;
+
+      case 'sync':
+        if (titleEl) titleEl.textContent = 'Synchronization Center';
+        this.renderSyncView(container);
+        break;
+
+      case 'employees':
+        if (titleEl) titleEl.textContent = 'Employee Enrollment & Management';
+        this.renderEmployeesView(container);
+        break;
+
+      case 'supervisors':
+        if (titleEl) titleEl.textContent = 'Supervisor Enrollment';
+        this.renderSupervisorsView(container);
+        break;
+
+      case 'landowners':
+        if (titleEl) titleEl.textContent = 'Landowner Enrollment';
+        this.renderLandownersView(container);
+        break;
+
+      case 'locations':
+        if (titleEl) titleEl.textContent = 'Work Location Enrollment';
+        this.renderLocationsView(container);
+        break;
+
+      case 'users':
+        if (titleEl) titleEl.textContent = 'User Accounts & Security';
+        this.renderUsersView(container);
+        break;
+
+      case 'audit':
+        if (titleEl) titleEl.textContent = 'Audit Trail & Change Logs';
+        this.renderAuditView(container);
+        break;
+
+      default:
+        this.renderDashboard(container);
+    }
+  }
+
+  /* ==========================================================================
+     LOGIN VIEW
+     ========================================================================== */
+  async renderLoginForm() {
+    const root = document.getElementById('login-view-wrapper');
+    if (!root) return;
+
+    let cachedLandowners = [];
+    try {
+      cachedLandowners = (await db.getAll('landowners')) || [];
+    } catch (e) {
+      cachedLandowners = [];
+    }
+
+    root.innerHTML = `
+      <div style="width: 100%; max-width: 440px; padding: 32px; background: #ffffff; border-radius: 16px; box-shadow: var(--shadow-lg); border: 1px solid var(--border);">
+        <div style="text-align: center; margin-bottom: 24px;">
+          <img src="icons/icon.svg" style="width: 64px; height: 64px; border-radius: 12px; margin-bottom: 12px;" alt="Logo" />
+          <h2 style="font-size: 20px; font-weight: 700; color: var(--primary);">Attendance System</h2>
+          <p style="font-size: 13px; color: var(--text-muted); margin-top: 4px;">Online & Offline Mobile Attendance Monitoring</p>
+        </div>
+
+        <form id="login-form">
+          <div class="form-group">
+            <label class="form-label required">Username</label>
+            <input type="text" id="login-username" class="form-control" placeholder="e.g. admin or supervisor1" required autocomplete="username" />
+          </div>
+
+          <div class="form-group">
+            <label class="form-label required">Password</label>
+            <input type="password" id="login-password" class="form-control" placeholder="••••••••" required autocomplete="current-password" />
+          </div>
+
+          <div class="form-group" id="login-landowner-wrapper">
+            <label class="form-label">🌾 Landowner for Area Checking <small style="color: var(--text-muted); font-weight: normal;">(For Supervisors)</small></label>
+            <select id="login-landowner-select" class="form-control">
+              <option value="">-- Select Landowner for Today's Area Checking --</option>
+              ${cachedLandowners.map((l) => `<option value="${this.escape(l.landownerName)}" data-id="${l.landownerId}" data-loc="${this.escape(l.workLocation || '')}">${this.escape(l.landownerName)}</option>`).join('')}
+            </select>
+            <div class="form-helper">Daily workers' Time IN punches will record this Landowner name.</div>
+          </div>
+
+          <div id="login-error-alert" style="display: none; padding: 10px 14px; background: #fee2e2; color: #b91c1c; border-radius: 8px; font-size: 13px; margin-bottom: 16px;"></div>
+
+          <button type="submit" id="login-submit-btn" class="btn btn-primary" style="width: 100%; padding: 12px; font-size: 15px;">
+            Sign In
+          </button>
+        </form>
+
+        <div style="margin-top: 24px; padding-top: 16px; border-top: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center;">
+          <span style="font-size: 12px; color: var(--text-muted);">
+            Network: <strong id="login-network-status">${navigator.onLine ? 'Online' : 'Offline'}</strong>
+          </span>
+          <button type="button" class="btn btn-outline" style="font-size: 12px; padding: 4px 10px;" onclick="app.openSettingsModal()">
+            ⚙ API Settings
+          </button>
+        </div>
+
+        <div style="margin-top: 12px; font-size: 11px; color: var(--text-light); text-align: center;">
+          Default setup login: <strong>admin</strong> / <strong>admin123</strong>
+        </div>
+      </div>
+    `;
+
+    document.getElementById('login-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const username = document.getElementById('login-username').value;
+      const password = document.getElementById('login-password').value;
+      const lndSelect = document.getElementById('login-landowner-select');
+      const errEl = document.getElementById('login-error-alert');
+      const submitBtn = document.getElementById('login-submit-btn');
+
+      errEl.style.display = 'none';
+      submitBtn.disabled = true;
+      submitBtn.textContent = 'Verifying...';
+
+      try {
+        const res = await auth.login(username, password);
+
+        // If supervisor selected a landowner at login, store it as active session landowner
+        if (lndSelect && lndSelect.value) {
+          const opt = lndSelect.options[lndSelect.selectedIndex];
+          const lndObj = {
+            id: opt.getAttribute('data-id') || '',
+            name: lndSelect.value,
+            workLocation: opt.getAttribute('data-loc') || ''
+          };
+          this.sessionLandowner = lndObj;
+          await db.setSetting('sessionLandowner', lndObj);
+        }
+
+        this.showToast(res.message, res.mode === 'offline' ? 'warning' : 'success');
+        this.renderAppShell();
+        this.navigateTo('dashboard');
+
+        // If supervisor logged in without selecting landowner, prompt them immediately
+        if (auth.isSupervisor() && (!this.sessionLandowner || !this.sessionLandowner.name)) {
+          setTimeout(() => this.promptSelectSessionLandowner(), 350);
+        }
+      } catch (err) {
+        errEl.textContent = err.message;
+        errEl.style.display = 'block';
+      } finally {
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Sign In';
+      }
+    });
+  }
+
+  /* ==========================================================================
+     DASHBOARD VIEW (ADMIN & SUPERVISOR)
+     ========================================================================== */
+  async renderDashboard(container) {
+    container.innerHTML = `<div style="text-align: center; padding: 40px; color: var(--text-muted);">Loading dashboard data...</div>`;
+
+    const isAdmin = auth.isAdmin();
+    const supervisorId = auth.getLinkedSupervisorId();
+
+    const [allEmployees, allSupervisors, allLandowners, allLocations, allAttendance, syncStats] = await Promise.all([
+      db.getAll('employees'),
+      db.getAll('supervisors'),
+      db.getAll('landowners'),
+      db.getAll('locations'),
+      db.getAll('attendance'),
+      syncService.getSyncStats()
+    ]);
+
+    // Role filtering: supervisors ONLY see their assigned data!
+    let employees = allEmployees;
+    let attendance = allAttendance.filter((a) => a.recordStatus !== 'DELETED');
+    let landowners = allLandowners;
+    let locations = allLocations;
+
+    if (!isAdmin && supervisorId) {
+      employees = allEmployees.filter((e) => (e.supervisorId || '').toString() === supervisorId.toString());
+      attendance = attendance.filter((a) => (a.supervisorId || '').toString() === supervisorId.toString());
+      landowners = allLandowners.filter((l) => (l.supervisorId || '').toString() === supervisorId.toString());
+      locations = allLocations.filter((loc) => (loc.supervisorId || '').toString() === supervisorId.toString());
+    }
+
+    const todayDate = new Date().toISOString().split('T')[0];
+    const todayRecords = attendance.filter((a) => a.attendanceDate === todayDate);
+
+    const totalEmployeesCount = employees.length;
+    const presentTodayCount = todayRecords.filter((a) => !!a.timeIn).length;
+    const clockedOutTodayCount = todayRecords.filter((a) => !!a.timeOut).length;
+    const notYetRecordedCount = Math.max(0, totalEmployeesCount - presentTodayCount);
+
+    const pendingSyncCount = syncStats.pendingRecords + syncStats.failedRecords;
+    const syncedCount = syncStats.syncedRecords;
+
+    container.innerHTML = `
+      ${!isAdmin ? `
+        <div class="content-card" style="background: linear-gradient(135deg, #15803d, #16a34a); color: #ffffff; padding: 16px 20px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-bottom: 20px;">
+          <div style="display: flex; align-items: center; gap: 14px;">
+            <div style="width: 44px; height: 44px; border-radius: 50%; background: rgba(255,255,255,0.2); display: flex; align-items: center; justify-content: center; font-size: 22px;">🌾</div>
+            <div>
+              <div style="font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; opacity: 0.9;">Current Area Checking (Landowner)</div>
+              <div style="font-size: 18px; font-weight: 700;">${this.sessionLandowner ? this.escape(this.sessionLandowner.name) : 'No Landowner Selected'}</div>
+              <div style="font-size: 12px; opacity: 0.9;">${this.sessionLandowner?.workLocation ? 'Location: ' + this.escape(this.sessionLandowner.workLocation) : 'Daily worker Time IN punches will record this Landowner name'}</div>
+            </div>
+          </div>
+          <button class="btn" style="background: #ffffff; color: var(--primary); font-weight: 700; font-size: 13px;" onclick="app.promptSelectSessionLandowner()">
+            ✏️ Change Landowner Area
+          </button>
+        </div>
+      ` : ''}
+
+      <div class="metrics-grid">
+        <div class="metric-card">
+          <div class="metric-card-header">
+            <span class="metric-title">${isAdmin ? 'Total Employees' : 'Assigned Employees'}</span>
+            <div class="metric-icon icon-green">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>
+            </div>
+          </div>
+          <div class="metric-value">${totalEmployeesCount}</div>
+        </div>
+
+        <div class="metric-card">
+          <div class="metric-card-header">
+            <span class="metric-title">Present Today (Time IN)</span>
+            <div class="metric-icon icon-green">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+            </div>
+          </div>
+          <div class="metric-value" style="color: var(--primary);">${presentTodayCount}</div>
+        </div>
+
+        <div class="metric-card">
+          <div class="metric-card-header">
+            <span class="metric-title">Not Yet Recorded</span>
+            <div class="metric-icon icon-red">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+            </div>
+          </div>
+          <div class="metric-value" style="color: var(--accent-red);">${notYetRecordedCount}</div>
+        </div>
+
+        <div class="metric-card">
+          <div class="metric-card-header">
+            <span class="metric-title">Pending Upload</span>
+            <div class="metric-icon icon-amber">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10"/></svg>
+            </div>
+          </div>
+          <div class="metric-value" style="color: #b45309;">${pendingSyncCount}</div>
+        </div>
+
+        <div class="metric-card">
+          <div class="metric-card-header">
+            <span class="metric-title">Synced to Sheets</span>
+            <div class="metric-icon icon-blue">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
+            </div>
+          </div>
+          <div class="metric-value" style="color: var(--accent-blue);">${syncedCount}</div>
+        </div>
+      </div>
+
+      <!-- Quick Action Banner -->
+      <div class="content-card" style="background: linear-gradient(135deg, #15803d, #16a34a); color: #ffffff; padding: 20px; display: flex; align-items: center; justify-content: space-between; flex-wrap: gap; margin-bottom: 24px;">
+        <div>
+          <h3 style="font-size: 18px; font-weight: 700; margin-bottom: 4px;">Ready to record attendance?</h3>
+          <p style="font-size: 13px; opacity: 0.9;">Time IN and Time OUT work seamlessly offline and online.</p>
+        </div>
+        <button class="btn" style="background: #ffffff; color: var(--primary); font-weight: 700;" onclick="app.navigateTo('attendance')">
+          Go to Attendance
+        </button>
+      </div>
+
+      <!-- Summary by Date and Location -->
+      <div class="content-card">
+        <div class="card-header">
+          <h3 class="card-title">Attendance Summary (Today - ${todayDate})</h3>
+          <span style="font-size: 13px; color: var(--text-muted);">${todayRecords.length} recorded session(s)</span>
+        </div>
+        <div class="card-body">
+          ${todayRecords.length === 0 ? `
+            <div style="text-align: center; padding: 32px; color: var(--text-muted);">
+              No attendance recorded yet for today (${todayDate}).
+            </div>
+          ` : `
+            <div class="table-responsive">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>Employee ID</th>
+                    <th>Name</th>
+                    <th>Location</th>
+                    <th>Landowner</th>
+                    <th>Time IN</th>
+                    <th>Time OUT</th>
+                    <th>GPS Coordinates</th>
+                    <th>Sync Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${todayRecords.map((r) => `
+                    <tr>
+                      <td><span class="emp-id-badge">${this.escape(r.employeeId)}</span></td>
+                      <td><strong>${this.escape(r.employeeName)}</strong></td>
+                      <td>${this.escape(r.workLocation || '-')}</td>
+                      <td>${this.escape(r.landownerName || '-')}</td>
+                      <td><strong style="color: var(--primary);">${this.escape(r.timeIn || '-')}</strong></td>
+                      <td>${this.escape(r.timeOut || '-')}</td>
+                      <td><small style="color: var(--text-muted);">${this.escape(r.actualGpsIn || '-')}</small></td>
+                      <td><span class="status-pill badge-${(r.syncStatus || 'PENDING').toLowerCase()}">${r.syncStatus}</span></td>
+                    </tr>
+                  `).join('')}
+                </tbody>
+              </table>
+            </div>
+          `}
+        </div>
+      </div>
+    `;
+  }
+
+  /* ==========================================================================
+     ATTENDANCE RECORDING VIEW (TIME IN & TIME OUT)
+     ========================================================================== */
+  async renderAttendanceRecording(container) {
+    const isAdmin = auth.isAdmin();
+    const supervisorId = auth.getLinkedSupervisorId();
+
+    const [allEmployees, allAttendance, landowners, locations] = await Promise.all([
+      db.getAll('employees'),
+      db.getAll('attendance'),
+      db.getAll('landowners'),
+      db.getAll('locations')
+    ]);
+
+    // Filter strictly by supervisor
+    let employees = allEmployees.filter((e) => e.employmentStatus === 'Active');
+    let myLandowners = landowners;
+    let myLocations = locations;
+
+    if (!isAdmin && supervisorId) {
+      employees = employees.filter((e) => (e.supervisorId || '').toString() === supervisorId.toString());
+      myLandowners = landowners.filter((l) => (l.supervisorId || '').toString() === supervisorId.toString());
+      myLocations = locations.filter((loc) => (loc.supervisorId || '').toString() === supervisorId.toString());
+    }
+
+    const todayDate = new Date().toISOString().split('T')[0];
+
+    container.innerHTML = `
+      <!-- Active Area Checking Banner for Supervisor -->
+      <div class="content-card" style="background: linear-gradient(135deg, #15803d, #16a34a); color: #ffffff; padding: 16px 20px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-bottom: 20px;">
+        <div style="display: flex; align-items: center; gap: 14px;">
+          <div style="width: 44px; height: 44px; border-radius: 50%; background: rgba(255,255,255,0.2); display: flex; align-items: center; justify-content: center; font-size: 22px;">🌾</div>
+          <div>
+            <div style="font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; opacity: 0.9;">Current Area Checking (Landowner)</div>
+            <div style="font-size: 18px; font-weight: 700;" id="recording-active-landowner">${this.sessionLandowner ? this.escape(this.sessionLandowner.name) : 'No Landowner Selected'}</div>
+            <div style="font-size: 12px; opacity: 0.9;">${this.sessionLandowner?.workLocation ? 'Location: ' + this.escape(this.sessionLandowner.workLocation) : 'Daily workers who Time IN will record this Landowner name'}</div>
+          </div>
+        </div>
+        <button class="btn" style="background: #ffffff; color: var(--primary); font-weight: 700; font-size: 13px;" onclick="app.promptSelectSessionLandowner()">
+          ✏️ Change Landowner Area
+        </button>
+      </div>
+
+      <!-- Toolbar Filters -->
+      <div class="toolbar">
+        <div class="search-input-wrapper">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+          <input type="text" id="att-search-input" class="search-input" placeholder="Search employee name or ID..." oninput="app.filterAttendanceList()" />
+        </div>
+
+        <select id="att-filter-location" class="select-filter" onchange="app.filterAttendanceList()">
+          <option value="">All Work Locations</option>
+          ${myLocations.map((loc) => `<option value="${this.escape(loc.workLocationName)}">${this.escape(loc.workLocationName)}</option>`).join('')}
+        </select>
+
+        <button class="btn btn-outline" onclick="app.refreshGpsManual()">
+          📍 Refresh GPS
+        </button>
+      </div>
+
+      <!-- Attendance List Container -->
+      <div id="attendance-cards-container">
+        <!-- Rendered dynamically -->
+      </div>
+    `;
+
+    this.cachedRecordingData = { employees, allAttendance, todayDate };
+    this.filterAttendanceList();
+  }
+
+  async filterAttendanceList() {
+    const container = document.getElementById('attendance-cards-container');
+    if (!container || !this.cachedRecordingData) return;
+
+    const query = (document.getElementById('att-search-input')?.value || '').toLowerCase().trim();
+    const selectedLocation = document.getElementById('att-filter-location')?.value || '';
+
+    const { employees, allAttendance, todayDate } = this.cachedRecordingData;
+
+    const filtered = employees.filter((emp) => {
+      const matchQuery = emp.employeeName.toLowerCase().includes(query) || emp.employeeId.toLowerCase().includes(query);
+      const matchLocation = !selectedLocation || (emp.workLocation || '') === selectedLocation;
+      return matchQuery && matchLocation;
+    });
+
+    if (filtered.length === 0) {
+      container.innerHTML = `
+        <div class="content-card" style="padding: 40px; text-align: center; color: var(--text-muted);">
+          No assigned employees found matching the filters.
+        </div>
+      `;
+      return;
+    }
+
+    container.innerHTML = filtered.map((emp) => {
+      // Find today's active attendance record for this employee
+      const todayRec = allAttendance.find(
+        (a) => a.employeeId === emp.employeeId && a.attendanceDate === todayDate && a.recordStatus !== 'DELETED'
+      );
+
+      const hasTimeIn = todayRec && !!todayRec.timeIn;
+      const hasTimeOut = todayRec && !!todayRec.timeOut;
+      const syncStatus = todayRec ? todayRec.syncStatus : null;
+
+      let statusPill = `<span class="status-pill status-offline">Not Recorded</span>`;
+      if (hasTimeIn && !hasTimeOut) {
+        statusPill = `<span class="status-pill status-online">Clocked IN</span>`;
+      } else if (hasTimeIn && hasTimeOut) {
+        statusPill = `<span class="status-pill" style="background: #e0f2fe; color: #0369a1;">Clocked OUT</span>`;
+      }
+
+      return `
+        <div class="emp-attendance-card">
+          <div class="emp-card-header">
+            <div>
+              <span class="emp-id-badge">${this.escape(emp.employeeId)}</span>
+              <div class="emp-name">${this.escape(emp.employeeName)}</div>
+              <div class="emp-location-info">
+                <span>📍 Location: <strong>${this.escape(emp.workLocation || 'Unassigned')}</strong></span>
+                <span>🌾 Landowner Area: <strong>${this.escape(todayRec?.landownerName || (this.sessionLandowner ? this.sessionLandowner.name : 'Pending Time IN'))}</strong></span>
+                <span>👤 Supervisor: ${this.escape(emp.supervisorName || 'Unassigned')}</span>
+              </div>
+            </div>
+            <div style="display: flex; flex-direction: column; align-items: flex-end; gap: 6px;">
+              ${statusPill}
+              ${syncStatus ? `<span class="status-pill badge-${syncStatus.toLowerCase()}">${syncStatus}</span>` : ''}
+            </div>
+          </div>
+
+          <!-- Times Display -->
+          <div class="emp-time-status">
+            <div>
+              <span style="font-size: 11px; color: var(--text-muted); display: block;">TIME IN</span>
+              <strong style="color: var(--primary); font-size: 14px;">${todayRec?.timeIn || '--:--'}</strong>
+              ${todayRec?.originalTimeIn && todayRec.originalTimeIn !== todayRec.timeIn ? `<small style="display:block; font-size:10px; color: var(--accent-amber);">(Adj from ${todayRec.originalTimeIn})</small>` : ''}
+            </div>
+            <div style="text-align: right;">
+              <span style="font-size: 11px; color: var(--text-muted); display: block;">TIME OUT</span>
+              <strong style="color: #0284c7; font-size: 14px;">${todayRec?.timeOut || '--:--'}</strong>
+              ${todayRec?.originalTimeOut && todayRec.originalTimeOut !== todayRec.timeOut ? `<small style="display:block; font-size:10px; color: var(--accent-amber);">(Adj from ${todayRec.originalTimeOut})</small>` : ''}
+            </div>
+          </div>
+
+          ${todayRec?.actualGpsIn ? `
+            <div style="font-size: 11px; color: var(--text-muted); background: #f8fafc; padding: 4px 8px; border-radius: 4px;">
+              Actual GPS: ${this.escape(todayRec.actualGpsIn)}
+            </div>
+          ` : ''}
+
+          <!-- Large Action Buttons -->
+          <div class="emp-actions">
+            ${!hasTimeIn ? `
+              <button class="btn btn-time-in" style="flex: 1;" onclick="app.recordTimeIn('${emp.employeeId}')">
+                <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+                TIME IN
+              </button>
+            ` : !hasTimeOut ? `
+              <button class="btn btn-time-out" style="flex: 1;" onclick="app.recordTimeOut('${todayRec.attendanceRecordId}')">
+                <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+                TIME OUT
+              </button>
+            ` : `
+              <div style="flex: 1; padding: 10px; text-align: center; background: #f0fdf4; color: #166534; font-weight: 600; border-radius: 8px; font-size: 13px;">
+                ✓ Completed Today
+              </div>
+            `}
+
+            <!-- Adjustment Button -->
+            <button class="btn btn-outline" title="Adjust date/time with audit trail" onclick="app.openAdjustmentModal('${emp.employeeId}', '${todayRec ? todayRec.attendanceRecordId : ''}')">
+              ⚙ Adjust
+            </button>
+          </div>
+        </div>
+      `;
+    }).join('');
+  }
+
+  // Refresh GPS Coordinates manually
+  async refreshGpsManual() {
+    this.showToast('Acquiring high-accuracy GPS coordinates...', 'info');
+    await this.initGpsTracking();
+    this.showToast(this.activeGps.coords ? `GPS Acquired: ${this.activeGps.coords}` : 'GPS not available.', this.activeGps.coords ? 'success' : 'warning');
+  }
+
+  // Record Standard Time IN
+  async recordTimeIn(employeeId) {
+    try {
+      // Ensure active Landowner area is selected for area checking
+      if (!this.sessionLandowner || !this.sessionLandowner.name) {
+        this.promptSelectSessionLandowner();
+        this.showToast('Please select the Landowner area you are checking before recording Time IN.', 'warning');
+        return;
+      }
+
+      const emp = await db.get('employees', employeeId);
+      if (!emp) throw new Error('Employee not found');
+
+      const todayDate = new Date().toISOString().split('T')[0];
+      const allAtt = await db.getAll('attendance');
+      const existing = allAtt.find(
+        (a) => a.employeeId === employeeId && a.attendanceDate === todayDate && a.recordStatus !== 'DELETED'
+      );
+
+      if (existing && existing.timeIn) {
+        throw new Error('Employee already has an active Time IN record for today.');
+      }
+
+      const now = new Date();
+      const timeStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: true });
+      const recordId = `REC-${Date.now()}-${Math.random().toString(36).substring(2, 7).toUpperCase()}`;
+      const currentUser = auth.getCurrentUser() || {};
+
+      const newRecord = {
+        attendanceRecordId: recordId,
+        employeeId: emp.employeeId,
+        employeeName: emp.employeeName,
+        supervisorId: emp.supervisorId || currentUser.linkedSupervisorId || '',
+        supervisorName: emp.supervisorName || currentUser.name || '',
+        landownerId: (this.sessionLandowner && this.sessionLandowner.id) ? this.sessionLandowner.id : '',
+        landownerName: (this.sessionLandowner && this.sessionLandowner.name) ? this.sessionLandowner.name : '',
+        locationId: emp.locationId || '',
+        workLocation: (this.sessionLandowner && this.sessionLandowner.workLocation) ? this.sessionLandowner.workLocation : (emp.workLocation || ''),
+        attendanceDate: todayDate,
+        timeIn: timeStr,
+        timeOut: '',
+        originalTimeIn: timeStr,
+        originalTimeOut: '',
+        adjustedBy: '',
+        adjustmentReason: '',
+        actualGpsIn: this.activeGps.coords ? `${this.activeGps.coords} (±${this.activeGps.accuracy}m)` : 'GPS Unavailable',
+        actualGpsOut: '',
+        deviceTimestamp: now.toISOString(),
+        synchronizationDate: '',
+        syncStatus: 'PENDING',
+        recordStatus: 'ACTIVE'
+      };
+
+      await db.put('attendance', newRecord);
+
+      this.showToast(`Time IN recorded for ${emp.employeeName} at ${this.sessionLandowner.name}. (Pending Sync)`, 'success');
+      this.renderAttendanceRecording(document.getElementById('view-content-root'));
+
+      // Auto sync if online
+      if (navigator.onLine) {
+        syncService.autoSync();
+      }
+    } catch (err) {
+      this.showToast(err.message, 'error');
+    }
+  }
+
+  // Record Standard Time OUT
+  async recordTimeOut(attendanceRecordId) {
+    try {
+      const record = await db.get('attendance', attendanceRecordId);
+      if (!record) throw new Error('Attendance record not found');
+      if (record.timeOut) throw new Error('Time OUT already recorded for this session.');
+
+      const now = new Date();
+      const timeStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: true });
+
+      record.timeOut = timeStr;
+      record.originalTimeOut = timeStr;
+      record.actualGpsOut = this.activeGps.coords ? `${this.activeGps.coords} (±${this.activeGps.accuracy}m)` : 'GPS Unavailable';
+      record.syncStatus = 'PENDING'; // Ready to sync update to server
+
+      await db.put('attendance', record);
+
+      this.showToast(`Time OUT recorded for ${record.employeeName} at ${timeStr}.`, 'success');
+      this.renderAttendanceRecording(document.getElementById('view-content-root'));
+
+      if (navigator.onLine) {
+        syncService.autoSync();
+      }
+    } catch (err) {
+      this.showToast(err.message, 'error');
+    }
+  }
+
+  // Adjustment Modal for Manual Attendance Adjustments
+  async openAdjustmentModal(employeeId, existingRecordId) {
+    const emp = await db.get('employees', employeeId);
+    let record = null;
+    if (existingRecordId) {
+      record = await db.get('attendance', existingRecordId);
+    }
+
+    const todayDate = new Date().toISOString().split('T')[0];
+    const nowTimeStr = new Date().toTimeString().substring(0, 5); // HH:MM for time input
+
+    const modal = document.getElementById('adjustment-modal');
+    const modalBody = document.getElementById('adjustment-modal-body');
+    if (!modal || !modalBody) return;
+
+    modalBody.innerHTML = `
+      <form id="adjustment-form">
+        <div style="background: var(--bg-page); padding: 12px; border-radius: var(--radius-sm); margin-bottom: 16px;">
+          <div style="font-weight: 700; color: var(--text-main);">${this.escape(emp.employeeName)}</div>
+          <div style="font-size: 12px; color: var(--text-muted);">ID: ${this.escape(emp.employeeId)} | Location: ${this.escape(emp.workLocation || 'None')}</div>
+        </div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label class="form-label required">Attendance Date</label>
+            <input type="date" id="adj-date" class="form-control" value="${record ? record.attendanceDate : todayDate}" required />
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label class="form-label">Time IN</label>
+            <input type="text" id="adj-time-in" class="form-control" placeholder="e.g. 07:30 AM" value="${record ? (record.timeIn || '') : ''}" />
+            <div class="form-helper">Format: hh:mm AM/PM</div>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Time OUT</label>
+            <input type="text" id="adj-time-out" class="form-control" placeholder="e.g. 04:30 PM" value="${record ? (record.timeOut || '') : ''}" />
+            <div class="form-helper">Format: hh:mm AM/PM</div>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label class="form-label">🌾 Area Checking Landowner</label>
+          <input type="text" id="adj-landowner" class="form-control" placeholder="e.g. Don Ramon Agricultural Estate" value="${record ? (record.landownerName || '') : (this.sessionLandowner ? this.sessionLandowner.name : '')}" />
+          <div class="form-helper">Landowner where area checking was conducted.</div>
+        </div>
+
+        <div class="form-group">
+          <label class="form-label required">Reason for Adjustment</label>
+          <textarea id="adj-reason" class="form-control" rows="2" placeholder="Explain why the timestamp was manually adjusted (Required for audit log)" required>${record?.adjustmentReason || ''}</textarea>
+        </div>
+
+        <div style="font-size: 11px; color: var(--text-muted);">
+          * Manual adjustments preserve original device timestamps and record the editor's username in the system audit logs.
+        </div>
+      </form>
+    `;
+
+    document.getElementById('save-adjustment-btn').onclick = async () => {
+      const adjDate = document.getElementById('adj-date').value;
+      const adjTimeIn = document.getElementById('adj-time-in').value.trim();
+      const adjTimeOut = document.getElementById('adj-time-out').value.trim();
+      const adjLandowner = (document.getElementById('adj-landowner')?.value || '').trim();
+      const adjReason = document.getElementById('adj-reason').value.trim();
+
+      if (!adjDate) {
+        alert('Please choose an attendance date.');
+        return;
+      }
+      if (!adjReason) {
+        alert('A reason is strictly required for manual attendance adjustments.');
+        return;
+      }
+
+      const currentUser = auth.getCurrentUser() || {};
+      const now = new Date();
+      const deviceTimeStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: true });
+
+      if (record) {
+        // Adjust existing record
+        if (!record.originalTimeIn && record.timeIn) record.originalTimeIn = record.timeIn;
+        if (!record.originalTimeOut && record.timeOut) record.originalTimeOut = record.timeOut;
+
+        record.attendanceDate = adjDate;
+        if (adjTimeIn) record.timeIn = adjTimeIn;
+        if (adjTimeOut) record.timeOut = adjTimeOut;
+        if (adjLandowner) record.landownerName = adjLandowner;
+        record.adjustedBy = currentUser.name || currentUser.username || 'Supervisor';
+        record.adjustmentReason = adjReason;
+        record.syncStatus = 'PENDING';
+
+        await db.put('attendance', record);
+      } else {
+        // Create new adjusted attendance entry
+        const recordId = `REC-${Date.now()}-${Math.random().toString(36).substring(2, 7).toUpperCase()}`;
+        const newRecord = {
+          attendanceRecordId: recordId,
+          employeeId: emp.employeeId,
+          employeeName: emp.employeeName,
+          supervisorId: emp.supervisorId || currentUser.linkedSupervisorId || '',
+          supervisorName: emp.supervisorName || currentUser.name || '',
+          landownerId: (this.sessionLandowner && this.sessionLandowner.id) ? this.sessionLandowner.id : '',
+          landownerName: adjLandowner || (this.sessionLandowner ? this.sessionLandowner.name : ''),
+          locationId: emp.locationId || '',
+          workLocation: (this.sessionLandowner && this.sessionLandowner.workLocation) ? this.sessionLandowner.workLocation : (emp.workLocation || ''),
+          attendanceDate: adjDate,
+          timeIn: adjTimeIn,
+          timeOut: adjTimeOut,
+          originalTimeIn: deviceTimeStr,
+          originalTimeOut: '',
+          adjustedBy: currentUser.name || currentUser.username || 'Supervisor',
+          adjustmentReason: adjReason,
+          actualGpsIn: this.activeGps.coords ? `${this.activeGps.coords} (±${this.activeGps.accuracy}m)` : 'GPS Unavailable',
+          actualGpsOut: '',
+          deviceTimestamp: now.toISOString(),
+          synchronizationDate: '',
+          syncStatus: 'PENDING',
+          recordStatus: 'ACTIVE'
+        };
+        await db.put('attendance', newRecord);
+      }
+
+      this.closeModal('adjustment-modal');
+      this.showToast('Attendance adjustment saved successfully.', 'success');
+      this.refreshCurrentView();
+
+      if (navigator.onLine) {
+        syncService.autoSync();
+      }
+    };
+
+    this.openModal('adjustment-modal');
+  }
+
+  /* ==========================================================================
+     ATTENDANCE HISTORY VIEW & EXPORT
+     ========================================================================== */
+  async renderHistory(container) {
+    const isAdmin = auth.isAdmin();
+    const supervisorId = auth.getLinkedSupervisorId();
+
+    const [allAttendance, allEmployees, landowners, locations, supervisors] = await Promise.all([
+      db.getAll('attendance'),
+      db.getAll('employees'),
+      db.getAll('landowners'),
+      db.getAll('locations'),
+      db.getAll('supervisors')
+    ]);
+
+    let records = allAttendance.filter((r) => r.recordStatus !== 'DELETED');
+    if (!isAdmin && supervisorId) {
+      records = records.filter((r) => (r.supervisorId || '').toString() === supervisorId.toString());
+    }
+
+    // Sort newest date first
+    records.sort((a, b) => (b.attendanceDate > a.attendanceDate ? 1 : -1));
+
+    container.innerHTML = `
+      <!-- History Toolbar -->
+      <div class="toolbar">
+        <div class="search-input-wrapper">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+          <input type="text" id="hist-search-input" class="search-input" placeholder="Search employee or record ID..." oninput="app.filterHistoryTable()" />
+        </div>
+
+        <input type="date" id="hist-date-filter" class="select-filter" onchange="app.filterHistoryTable()" title="Filter by date" />
+
+        <select id="hist-landowner-filter" class="select-filter" onchange="app.filterHistoryTable()">
+          <option value="">All Landowners</option>
+          ${landowners.map((l) => `<option value="${this.escape(l.landownerName)}">${this.escape(l.landownerName)}</option>`).join('')}
+        </select>
+
+        <select id="hist-location-filter" class="select-filter" onchange="app.filterHistoryTable()">
+          <option value="">All Locations</option>
+          ${locations.map((loc) => `<option value="${this.escape(loc.workLocationName)}">${this.escape(loc.workLocationName)}</option>`).join('')}
+        </select>
+
+        <select id="hist-sync-filter" class="select-filter" onchange="app.filterHistoryTable()">
+          <option value="">All Sync Statuses</option>
+          <option value="SYNCED">SYNCED</option>
+          <option value="PENDING">PENDING</option>
+          <option value="FAILED">FAILED</option>
+        </select>
+
+        <button class="btn btn-outline" onclick="app.exportHistoryCsv()">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          Export CSV
+        </button>
+      </div>
+
+      <!-- History Data Table -->
+      <div class="content-card">
+        <div class="card-header">
+          <h3 class="card-title">Attendance Log Records</h3>
+          <span id="hist-count-badge" class="status-pill status-online">${records.length} Records</span>
+        </div>
+        <div class="card-body" style="padding: 0;">
+          <div class="table-responsive">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Record ID</th>
+                  <th>Date</th>
+                  <th>Employee ID</th>
+                  <th>Employee Name</th>
+                  <th>Location</th>
+                  <th>Landowner</th>
+                  ${isAdmin ? '<th>Supervisor</th>' : ''}
+                  <th>Time IN</th>
+                  <th>Time OUT</th>
+                  <th>Actual GPS</th>
+                  <th>Sync Status</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody id="history-table-body">
+                <!-- Rendered dynamically -->
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    `;
+
+    this.cachedHistoryData = { records, isAdmin };
+    this.filterHistoryTable();
+  }
+
+  filterHistoryTable() {
+    const tbody = document.getElementById('history-table-body');
+    const countBadge = document.getElementById('hist-count-badge');
+    if (!tbody || !this.cachedHistoryData) return;
+
+    const query = (document.getElementById('hist-search-input')?.value || '').toLowerCase().trim();
+    const dateVal = document.getElementById('hist-date-filter')?.value || '';
+    const lndVal = document.getElementById('hist-landowner-filter')?.value || '';
+    const locVal = document.getElementById('hist-location-filter')?.value || '';
+    const syncVal = document.getElementById('hist-sync-filter')?.value || '';
+
+    const { records, isAdmin } = this.cachedHistoryData;
+
+    const filtered = records.filter((r) => {
+      const matchQuery = r.employeeName.toLowerCase().includes(query) ||
+                         r.employeeId.toLowerCase().includes(query) ||
+                         r.attendanceRecordId.toLowerCase().includes(query);
+      const matchDate = !dateVal || r.attendanceDate === dateVal;
+      const matchLnd = !lndVal || (r.landownerName || '') === lndVal;
+      const matchLoc = !locVal || (r.workLocation || '') === locVal;
+      const matchSync = !syncVal || r.syncStatus === syncVal;
+      return matchQuery && matchDate && matchLnd && matchLoc && matchSync;
+    });
+
+    if (countBadge) countBadge.textContent = `${filtered.length} Records`;
+
+    if (filtered.length === 0) {
+      tbody.innerHTML = `<tr><td colspan="${isAdmin ? 12 : 11}" style="text-align: center; padding: 32px; color: var(--text-muted);">No records found matching filters.</td></tr>`;
+      return;
+    }
+
+    tbody.innerHTML = filtered.map((r) => `
+      <tr>
+        <td><small style="font-family: monospace;">${this.escape(r.attendanceRecordId)}</small></td>
+        <td><strong>${this.escape(r.attendanceDate)}</strong></td>
+        <td><span class="emp-id-badge">${this.escape(r.employeeId)}</span></td>
+        <td><strong>${this.escape(r.employeeName)}</strong></td>
+        <td>${this.escape(r.workLocation || '-')}</td>
+        <td>${this.escape(r.landownerName || '-')}</td>
+        ${isAdmin ? `<td>${this.escape(r.supervisorName || '-')}</td>` : ''}
+        <td><span style="color: var(--primary); font-weight: 600;">${this.escape(r.timeIn || '-')}</span></td>
+        <td><span style="color: #0284c7; font-weight: 600;">${this.escape(r.timeOut || '-')}</span></td>
+        <td><small style="color: var(--text-muted);">${this.escape(r.actualGpsIn || '-')}</small></td>
+        <td><span class="status-pill badge-${(r.syncStatus || 'PENDING').toLowerCase()}">${r.syncStatus}</span></td>
+        <td>
+          <button class="btn btn-outline" style="padding: 4px 8px; font-size: 11px;" onclick="app.viewRecordDetails('${r.attendanceRecordId}')">
+            Details
+          </button>
+          <button class="btn btn-danger" style="padding: 4px 8px; font-size: 11px;" onclick="app.confirmSoftDelete('${r.attendanceRecordId}')">
+            Delete
+          </button>
+        </td>
+      </tr>
+    `).join('');
+  }
+
+  // View Detailed Modal with Audit trail & GPS
+  async viewRecordDetails(recordId) {
+    const rec = await db.get('attendance', recordId);
+    if (!rec) return;
+
+    const modal = document.getElementById('details-modal');
+    const modalBody = document.getElementById('details-modal-body');
+    if (!modal || !modalBody) return;
+
+    modalBody.innerHTML = `
+      <div style="display: flex; flex-direction: column; gap: 12px; font-size: 13px;">
+        <div style="background: var(--bg-page); padding: 12px; border-radius: var(--radius-sm);">
+          <div>Record ID: <strong style="font-family: monospace;">${this.escape(rec.attendanceRecordId)}</strong></div>
+          <div>Employee: <strong>${this.escape(rec.employeeName)} (${this.escape(rec.employeeId)})</strong></div>
+          <div>Date: <strong>${this.escape(rec.attendanceDate)}</strong></div>
+        </div>
+
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+          <div style="background: #f0fdf4; padding: 10px; border-radius: 6px;">
+            <div style="font-weight: 600; color: var(--primary);">TIME IN</div>
+            <div style="font-size: 16px; font-weight: 700;">${this.escape(rec.timeIn || 'None')}</div>
+            <div style="font-size: 11px; color: var(--text-muted);">Orig: ${this.escape(rec.originalTimeIn || 'None')}</div>
+            <div style="font-size: 11px; color: var(--text-muted);">GPS: ${this.escape(rec.actualGpsIn || 'None')}</div>
+          </div>
+
+          <div style="background: #e0f2fe; padding: 10px; border-radius: 6px;">
+            <div style="font-weight: 600; color: #0284c7;">TIME OUT</div>
+            <div style="font-size: 16px; font-weight: 700;">${this.escape(rec.timeOut || 'None')}</div>
+            <div style="font-size: 11px; color: var(--text-muted);">Orig: ${this.escape(rec.originalTimeOut || 'None')}</div>
+            <div style="font-size: 11px; color: var(--text-muted);">GPS: ${this.escape(rec.actualGpsOut || 'None')}</div>
+          </div>
+        </div>
+
+        <div>Assigned Work Location: <strong>${this.escape(rec.workLocation || 'Unassigned')}</strong></div>
+        <div>Assigned Landowner: <strong>${this.escape(rec.landownerName || 'Unassigned')}</strong></div>
+        <div>Supervisor: <strong>${this.escape(rec.supervisorName || 'Unassigned')}</strong></div>
+
+        ${rec.adjustedBy ? `
+          <div style="background: #fef3c7; padding: 10px; border-radius: 6px; border: 1px solid #fde68a;">
+            <div style="font-weight: 700; color: #b45309;">Adjustment Audit Trail</div>
+            <div>Adjusted By: <strong>${this.escape(rec.adjustedBy)}</strong></div>
+            <div>Reason: <em>"${this.escape(rec.adjustmentReason)}"</em></div>
+          </div>
+        ` : ''}
+
+        <div style="border-top: 1px solid var(--border); padding-top: 8px; font-size: 11px; color: var(--text-muted);">
+          <div>Device Capture Timestamp: ${this.escape(rec.deviceTimestamp || '-')}</div>
+          <div>Synchronization Date: ${this.escape(rec.synchronizationDate || 'Not yet synced')}</div>
+          <div>Status: <span class="status-pill badge-${(rec.syncStatus || 'PENDING').toLowerCase()}">${rec.syncStatus}</span></div>
+        </div>
+      </div>
+    `;
+
+    this.openModal('details-modal');
+  }
+
+  // Soft Delete Attendance Confirmation
+  async confirmSoftDelete(recordId) {
+    const reason = prompt('Please enter the reason for deleting this attendance record (Required for Audit Trail):');
+    if (!reason || !reason.trim()) {
+      alert('Deletion cancelled. A reason is required for deletion.');
+      return;
+    }
+
+    try {
+      const rec = await db.get('attendance', recordId);
+      if (!rec) throw new Error('Record not found.');
+
+      rec.recordStatus = 'DELETED';
+      rec.syncStatus = 'PENDING'; // Sync deletion to Sheets
+      await db.put('attendance', rec);
+
+      // Log audit
+      const currentUser = auth.getCurrentUser() || {};
+      const auditLog = {
+        logId: `LOG-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+        userId: currentUser.userId || 'SYSTEM',
+        userRole: currentUser.role || 'Supervisor',
+        action: 'SOFT_DELETE_ATTENDANCE',
+        recordId: recordId,
+        previousValue: 'ACTIVE',
+        newValue: 'DELETED',
+        reason: reason.trim(),
+        dateTime: new Date().toISOString()
+      };
+      await db.put('auditLogs', auditLog);
+
+      this.showToast('Attendance record soft-deleted and logged to audit trail.', 'success');
+      this.refreshCurrentView();
+
+      if (navigator.onLine) {
+        syncService.autoSync();
+      }
+    } catch (err) {
+      this.showToast(err.message, 'error');
+    }
+  }
+
+  // Export Attendance to CSV
+  async exportHistoryCsv() {
+    const allAttendance = await db.getAll('attendance');
+    const validRecords = allAttendance.filter((r) => r.recordStatus !== 'DELETED');
+
+    if (validRecords.length === 0) {
+      alert('No attendance records available to export.');
+      return;
+    }
+
+    const headers = [
+      'Attendance Record ID', 'Employee ID', 'Employee Name', 'Supervisor ID', 'Supervisor Name',
+      'Landowner ID', 'Landowner Name', 'Location ID', 'Work Location', 'Attendance Date',
+      'Time IN', 'Time OUT', 'Original Time IN', 'Original Time OUT', 'Adjusted By',
+      'Adjustment Reason', 'Actual GPS IN', 'Actual GPS OUT', 'Device Timestamp',
+      'Synchronization Date', 'Synchronization Status'
+    ];
+
+    const rows = validRecords.map((r) => [
+      `"${r.attendanceRecordId}"`,
+      `"${r.employeeId}"`,
+      `"${r.employeeName}"`,
+      `"${r.supervisorId || ''}"`,
+      `"${r.supervisorName || ''}"`,
+      `"${r.landownerId || ''}"`,
+      `"${r.landownerName || ''}"`,
+      `"${r.locationId || ''}"`,
+      `"${r.workLocation || ''}"`,
+      `"${r.attendanceDate}"`,
+      `"${r.timeIn || ''}"`,
+      `"${r.timeOut || ''}"`,
+      `"${r.originalTimeIn || ''}"`,
+      `"${r.originalTimeOut || ''}"`,
+      `"${r.adjustedBy || ''}"`,
+      `"${(r.adjustmentReason || '').replace(/"/g, '""')}"`,
+      `"${r.actualGpsIn || ''}"`,
+      `"${r.actualGpsOut || ''}"`,
+      `"${r.deviceTimestamp || ''}"`,
+      `"${r.synchronizationDate || ''}"`,
+      `"${r.syncStatus}"`
+    ]);
+
+    const csvContent = '\uFEFF' + [headers.join(','), ...rows.map((row) => row.join(','))].join('\r\n');
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `Attendance_Report_${new Date().toISOString().split('T')[0]}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  /* ==========================================================================
+     SYNCHRONIZATION CENTER VIEW
+     ========================================================================== */
+  async renderSyncView(container) {
+    const stats = await syncService.getSyncStats();
+    const allAtt = await db.getAll('attendance');
+    const pendingList = allAtt.filter((r) => r.syncStatus === 'PENDING' || r.syncStatus === 'FAILED' || r.syncStatus === 'SYNCING');
+
+    container.innerHTML = `
+      <div class="metrics-grid">
+        <div class="metric-card">
+          <span class="metric-title">Connection Status</span>
+          <div class="metric-value">
+            <span class="status-pill ${stats.isOnline ? 'status-online' : 'status-offline'}">
+              <span class="status-dot"></span> ${stats.isOnline ? 'Online' : 'Offline'}
+            </span>
+          </div>
+        </div>
+
+        <div class="metric-card">
+          <span class="metric-title">Pending Upload</span>
+          <div class="metric-value" style="color: #b45309;">${stats.pendingRecords}</div>
+        </div>
+
+        <div class="metric-card">
+          <span class="metric-title">Failed Attempts</span>
+          <div class="metric-value" style="color: var(--accent-red);">${stats.failedRecords}</div>
+        </div>
+
+        <div class="metric-card">
+          <span class="metric-title">Synced to Sheets</span>
+          <div class="metric-value" style="color: var(--primary);">${stats.syncedRecords}</div>
+        </div>
+
+        <div class="metric-card">
+          <span class="metric-title">Total Local Records</span>
+          <div class="metric-value">${stats.totalRecords}</div>
+        </div>
+      </div>
+
+      <!-- Sync Controls -->
+      <div class="content-card">
+        <div class="card-header">
+          <h3 class="card-title">Synchronization Controls</h3>
+          <span style="font-size: 12px; color: var(--text-muted);">Last Sync: <strong>${stats.lastSyncTime}</strong></span>
+        </div>
+        <div class="card-body">
+          <div style="display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 20px;">
+            <button class="btn btn-primary" onclick="app.triggerSyncAll()">
+              ⚡ Sync All Pending Records
+            </button>
+            <button class="btn btn-outline" onclick="app.triggerRetryFailed()">
+              🔄 Retry Failed Records
+            </button>
+            <button class="btn btn-outline" onclick="app.triggerSyncSelected()">
+              📤 Sync Selected Records
+            </button>
+            <button class="btn btn-outline" onclick="app.pullFreshData()">
+              ⬇ Pull Latest from Google Sheets
+            </button>
+          </div>
+
+          ${stats.lastSyncError ? `
+            <div style="padding: 12px; background: #fee2e2; color: #b91c1c; border-radius: 8px; font-size: 13px; margin-bottom: 16px;">
+              <strong>Last Sync Error:</strong> ${this.escape(stats.lastSyncError)}
+            </div>
+          ` : ''}
+
+          <h4 style="font-size: 14px; font-weight: 700; margin-bottom: 10px;">Queue of Pending & Failed Records</h4>
+          ${pendingList.length === 0 ? `
+            <div style="text-align: center; padding: 32px; color: var(--text-muted); background: var(--bg-page); border-radius: 8px;">
+              🎉 All records are successfully synchronized with Google Sheets!
+            </div>
+          ` : `
+            <div class="table-responsive">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th width="30"><input type="checkbox" onchange="app.toggleSelectAllSync(this)" /></th>
+                    <th>Record ID</th>
+                    <th>Date</th>
+                    <th>Employee ID</th>
+                    <th>Employee Name</th>
+                    <th>Time IN</th>
+                    <th>Time OUT</th>
+                    <th>Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${pendingList.map((r) => `
+                    <tr>
+                      <td><input type="checkbox" class="sync-row-checkbox" value="${r.attendanceRecordId}" onchange="app.toggleSyncCheckbox('${r.attendanceRecordId}', this.checked)" /></td>
+                      <td><small style="font-family: monospace;">${this.escape(r.attendanceRecordId)}</small></td>
+                      <td>${this.escape(r.attendanceDate)}</td>
+                      <td><span class="emp-id-badge">${this.escape(r.employeeId)}</span></td>
+                      <td><strong>${this.escape(r.employeeName)}</strong></td>
+                      <td>${this.escape(r.timeIn || '-')}</td>
+                      <td>${this.escape(r.timeOut || '-')}</td>
+                      <td><span class="status-pill badge-${r.syncStatus.toLowerCase()}">${r.syncStatus}</span></td>
+                    </tr>
+                  `).join('')}
+                </tbody>
+              </table>
+            </div>
+          `}
+        </div>
+      </div>
+    `;
+  }
+
+  toggleSyncCheckbox(id, isChecked) {
+    if (isChecked) this.selectedSyncIds.add(id);
+    else this.selectedSyncIds.delete(id);
+  }
+
+  toggleSelectAllSync(masterCheckbox) {
+    const checkboxes = document.querySelectorAll('.sync-row-checkbox');
+    checkboxes.forEach((cb) => {
+      cb.checked = masterCheckbox.checked;
+      this.toggleSyncCheckbox(cb.value, masterCheckbox.checked);
+    });
+  }
+
+  async triggerSyncAll() {
+    try {
+      this.showToast('Starting batch sync...', 'info');
+      const res = await syncService.syncAllPending();
+      this.showToast(res.message, 'success');
+      this.renderSyncView(document.getElementById('view-content-root'));
+    } catch (err) {
+      this.showToast(err.message, 'error');
+      this.renderSyncView(document.getElementById('view-content-root'));
+    }
+  }
+
+  async triggerRetryFailed() {
+    try {
+      this.showToast('Retrying failed records...', 'info');
+      await syncService.retryFailed();
+      this.renderSyncView(document.getElementById('view-content-root'));
+    } catch (err) {
+      this.showToast(err.message, 'error');
+    }
+  }
+
+  async triggerSyncSelected() {
+    if (this.selectedSyncIds.size === 0) {
+      alert('Please check at least one record to sync.');
+      return;
+    }
+    try {
+      this.showToast(`Syncing ${this.selectedSyncIds.size} selected records...`, 'info');
+      await syncService.syncSelected(Array.from(this.selectedSyncIds));
+      this.selectedSyncIds.clear();
+      this.renderSyncView(document.getElementById('view-content-root'));
+    } catch (err) {
+      this.showToast(err.message, 'error');
+    }
+  }
+
+  async pullFreshData() {
+    try {
+      this.showToast('Pulling latest metadata from Google Sheets...', 'info');
+      await syncService.pullRemoteData();
+      this.showToast('Local database updated from Google Sheets.', 'success');
+      this.renderSyncView(document.getElementById('view-content-root'));
+    } catch (err) {
+      this.showToast(err.message, 'error');
+    }
+  }
+
+  /* ==========================================================================
+     ADMIN MODULE 1: EMPLOYEE ENROLLMENT & MANAGEMENT
+     ========================================================================== */
+  async renderEmployeesView(container) {
+    const [employees, supervisors, landowners, locations] = await Promise.all([
+      db.getAll('employees'),
+      db.getAll('supervisors'),
+      db.getAll('landowners'),
+      db.getAll('locations')
+    ]);
+
+    container.innerHTML = `
+      <div class="content-card">
+        <div class="card-header">
+          <h3 class="card-title">Employee Enrollment (Admin)</h3>
+          <span style="font-size: 12px; color: var(--text-muted);">* Employee ID must be manually entered and unique</span>
+        </div>
+        <div class="card-body">
+          <form id="enroll-employee-form">
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label required">Employee ID (Manual Entry)</label>
+                <input type="text" id="emp-id-input" class="form-control" placeholder="e.g. 00123 or EMP-042" required />
+                <div class="form-helper">Exact format, letters, numbers, and leading zeros will be preserved.</div>
+              </div>
+
+              <div class="form-group">
+                <label class="form-label required">Employee Full Name</label>
+                <input type="text" id="emp-name-input" class="form-control" placeholder="e.g. Pedro Santos" required />
+              </div>
+
+              <div class="form-group">
+                <label class="form-label required">Position</label>
+                <input type="text" id="emp-pos-input" class="form-control" placeholder="e.g. Harvester / Field Tech" required />
+              </div>
+            </div>
+
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label">Department (Optional)</label>
+                <input type="text" id="emp-dept-input" class="form-control" placeholder="e.g. Agriculture Operations" />
+              </div>
+
+              <div class="form-group">
+                <label class="form-label required">Assigned Supervisor</label>
+                <select id="emp-sup-select" class="form-control" required>
+                  <option value="">Select Supervisor</option>
+                  ${supervisors.map((s) => `<option value="${s.supervisorId}" data-name="${this.escape(s.supervisorName)}">${this.escape(s.supervisorName)} (${s.supervisorId})</option>`).join('')}
+                </select>
+              </div>
+
+              <div class="form-group">
+                <label class="form-label required">Assigned Work Location</label>
+                <select id="emp-loc-select" class="form-control" required>
+                  <option value="">Select Location</option>
+                  ${locations.map((loc) => `<option value="${loc.locationId}" data-name="${this.escape(loc.workLocationName)}">${this.escape(loc.workLocationName)}</option>`).join('')}
+                </select>
+              </div>
+            </div>
+
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label required">Employment Status</label>
+                <select id="emp-status-select" class="form-control" required>
+                  <option value="Active">Active</option>
+                  <option value="Inactive">Inactive</option>
+                </select>
+              </div>
+
+              <div class="form-group">
+                <label class="form-label required">Date Enrolled</label>
+                <input type="date" id="emp-date-enrolled" class="form-control" value="${new Date().toISOString().split('T')[0]}" required />
+              </div>
+            </div>
+
+            <div style="display: flex; gap: 10px; justify-content: flex-end; margin-top: 10px;">
+              <button type="button" id="emp-cancel-edit-btn" class="btn btn-outline" style="display: none;" onclick="app.cancelEmployeeEdit()">Cancel Edit</button>
+              <button type="submit" id="emp-save-btn" class="btn btn-primary">Enroll Employee</button>
+            </div>
+          </form>
+        </div>
+      </div>
+
+      <!-- Enrolled Employees Table -->
+      <div class="content-card">
+        <div class="card-header">
+          <h3 class="card-title">Enrolled Employees Directory (${employees.length})</h3>
+        </div>
+        <div class="card-body" style="padding: 0;">
+          <div class="table-responsive">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Employee ID</th>
+                  <th>Full Name</th>
+                  <th>Position</th>
+                  <th>Supervisor</th>
+                  <th>Location</th>
+                  <th>Status</th>
+                  <th>Enrolled</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${employees.length === 0 ? `<tr><td colspan="8" style="text-align: center; padding: 24px;">No employees enrolled yet.</td></tr>` : employees.map((emp) => `
+                  <tr>
+                    <td><span class="emp-id-badge">${this.escape(emp.employeeId)}</span></td>
+                    <td><strong>${this.escape(emp.employeeName)}</strong></td>
+                    <td>${this.escape(emp.position || '-')}</td>
+                    <td>${this.escape(emp.supervisorName || '-')}</td>
+                    <td>${this.escape(emp.workLocation || '-')}</td>
+                    <td><span class="status-pill ${emp.employmentStatus === 'Active' ? 'status-online' : 'status-offline'}">${emp.employmentStatus}</span></td>
+                    <td><small>${this.escape(emp.dateEnrolled || '-')}</small></td>
+                    <td>
+                      <button class="btn btn-outline" style="padding: 4px 8px; font-size: 11px;" onclick="app.editEmployee('${emp.employeeId}')">Edit / Reassign</button>
+                    </td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    `;
+
+    document.getElementById('enroll-employee-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      await this.saveEmployeeHandler();
+    });
+  }
+
+  async saveEmployeeHandler() {
+    const empId = document.getElementById('emp-id-input').value.trim();
+    const empName = document.getElementById('emp-name-input').value.trim();
+    const position = document.getElementById('emp-pos-input').value.trim();
+    const dept = document.getElementById('emp-dept-input').value.trim();
+    const supSelect = document.getElementById('emp-sup-select');
+    const locSelect = document.getElementById('emp-loc-select');
+    const status = document.getElementById('emp-status-select').value;
+    const dateEnrolled = document.getElementById('emp-date-enrolled').value;
+
+    const supervisorId = supSelect.value;
+    const supervisorName = supSelect.options[supSelect.selectedIndex]?.getAttribute('data-name') || '';
+
+    const locationId = locSelect.value;
+    const workLocation = locSelect.options[locSelect.selectedIndex]?.getAttribute('data-name') || '';
+
+    const isEdit = !!this.currentEditEmployee;
+
+    // Check duplicate Employee ID if adding new
+    if (!isEdit) {
+      const existing = await db.get('employees', empId);
+      if (existing) {
+        alert(`Employee ID "${empId}" already exists. Duplicate IDs are not allowed!`);
+        return;
+      }
+    }
+
+    const employeeObj = {
+      employeeId: empId,
+      employeeName: empName,
+      position: position,
+      department: dept,
+      supervisorId: supervisorId,
+      supervisorName: supervisorName,
+      landownerId: '',
+      landownerName: '',
+      locationId: locationId,
+      workLocation: workLocation,
+      employmentStatus: status,
+      dateEnrolled: dateEnrolled
+    };
+
+    // Save locally to IndexedDB
+    await db.put('employees', employeeObj);
+
+    // If online, save directly to Google Sheets API
+    const apiUrl = await db.getSetting('apiUrl', '');
+    if (navigator.onLine && apiUrl) {
+      try {
+        const currentUser = auth.getCurrentUser() || {};
+        await fetch(apiUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+          body: JSON.stringify({
+            action: 'SAVE_EMPLOYEE',
+            employee: employeeObj,
+            isEdit: isEdit,
+            userId: currentUser.userId || 'ADMIN',
+            userRole: currentUser.role || 'Admin'
+          })
+        });
+      } catch (e) {
+        console.warn('[Employee] Server save will sync later:', e);
+      }
+    }
+
+    this.showToast(`Employee ${empName} saved successfully!`, 'success');
+    this.cancelEmployeeEdit();
+    this.renderEmployeesView(document.getElementById('view-content-root'));
+  }
+
+  async editEmployee(employeeId) {
+    const emp = await db.get('employees', employeeId);
+    if (!emp) return;
+
+    this.currentEditEmployee = emp;
+
+    document.getElementById('emp-id-input').value = emp.employeeId;
+    document.getElementById('emp-id-input').disabled = true; // Employee ID remains unchanged on edit
+    document.getElementById('emp-name-input').value = emp.employeeName;
+    document.getElementById('emp-pos-input').value = emp.position || '';
+    document.getElementById('emp-dept-input').value = emp.department || '';
+    document.getElementById('emp-sup-select').value = emp.supervisorId || '';
+    document.getElementById('emp-loc-select').value = emp.locationId || '';
+    document.getElementById('emp-status-select').value = emp.employmentStatus || 'Active';
+    document.getElementById('emp-date-enrolled').value = emp.dateEnrolled || '';
+
+    document.getElementById('emp-cancel-edit-btn').style.display = 'inline-flex';
+    document.getElementById('emp-save-btn').textContent = 'Update & Reassign Employee';
+
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+
+  cancelEmployeeEdit() {
+    this.currentEditEmployee = null;
+    const form = document.getElementById('enroll-employee-form');
+    if (form) form.reset();
+    const idInput = document.getElementById('emp-id-input');
+    if (idInput) idInput.disabled = false;
+    const cancelBtn = document.getElementById('emp-cancel-edit-btn');
+    if (cancelBtn) cancelBtn.style.display = 'none';
+    const saveBtn = document.getElementById('emp-save-btn');
+    if (saveBtn) saveBtn.textContent = 'Enroll Employee';
+  }
+
+  /* ==========================================================================
+     ADMIN MODULE 2: SUPERVISOR ENROLLMENT
+     ========================================================================== */
+  async renderSupervisorsView(container) {
+    const supervisors = await db.getAll('supervisors');
+
+    container.innerHTML = `
+      <div class="content-card">
+        <div class="card-header">
+          <h3 class="card-title">Supervisor Enrollment</h3>
+        </div>
+        <div class="card-body">
+          <form id="enroll-sup-form">
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label required">Supervisor ID</label>
+                <input type="text" id="sup-id-input" class="form-control" placeholder="e.g. SUP-001" required />
+              </div>
+              <div class="form-group">
+                <label class="form-label required">Full Name</label>
+                <input type="text" id="sup-name-input" class="form-control" placeholder="e.g. Juan Dela Cruz" required />
+              </div>
+              <div class="form-group">
+                <label class="form-label required">Username (Login Account)</label>
+                <input type="text" id="sup-user-input" class="form-control" placeholder="e.g. jdelacruz" required />
+              </div>
+            </div>
+
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label required">Password</label>
+                <input type="password" id="sup-pass-input" class="form-control" placeholder="••••••••" required />
+              </div>
+              <div class="form-group">
+                <label class="form-label required">Account Status</label>
+                <select id="sup-status-select" class="form-control">
+                  <option value="Active">Active</option>
+                  <option value="Inactive">Inactive</option>
+                </select>
+              </div>
+            </div>
+
+            <div style="text-align: right; margin-top: 10px;">
+              <button type="submit" class="btn btn-primary">Enroll Supervisor</button>
+            </div>
+          </form>
+        </div>
+      </div>
+
+      <div class="content-card">
+        <div class="card-header">
+          <h3 class="card-title">Supervisors Directory (${supervisors.length})</h3>
+        </div>
+        <div class="card-body" style="padding: 0;">
+          <div class="table-responsive">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Supervisor ID</th>
+                  <th>Full Name</th>
+                  <th>Username</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${supervisors.map((s) => `
+                  <tr>
+                    <td><span class="emp-id-badge">${this.escape(s.supervisorId)}</span></td>
+                    <td><strong>${this.escape(s.supervisorName)}</strong></td>
+                    <td>${this.escape(s.username)}</td>
+                    <td><span class="status-pill ${s.accountStatus === 'Active' ? 'status-online' : 'status-offline'}">${s.accountStatus}</span></td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    `;
+
+    document.getElementById('enroll-sup-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const supId = document.getElementById('sup-id-input').value.trim();
+      const supName = document.getElementById('sup-name-input').value.trim();
+      const username = document.getElementById('sup-user-input').value.trim();
+      const pass = document.getElementById('sup-pass-input').value;
+      const status = document.getElementById('sup-status-select').value;
+
+      const passwordHash = await auth.hashPassword(pass);
+
+      const supervisorObj = {
+        supervisorId: supId,
+        supervisorName: supName,
+        username: username,
+        passwordHash: passwordHash,
+        accountStatus: status
+      };
+
+      await db.put('supervisors', supervisorObj);
+
+      // Sync account to users store
+      const userObj = {
+        userId: `USR-${supId}`,
+        username: username,
+        passwordHash: passwordHash,
+        role: 'Supervisor',
+        linkedSupervisorId: supId,
+        name: supName,
+        accountStatus: status,
+        lastLogin: ''
+      };
+      await db.put('users', userObj);
+
+      const apiUrl = await db.getSetting('apiUrl', '');
+      if (navigator.onLine && apiUrl) {
+        try {
+          const currentUser = auth.getCurrentUser() || {};
+          await fetch(apiUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+            body: JSON.stringify({
+              action: 'SAVE_SUPERVISOR',
+              supervisor: supervisorObj,
+              userId: currentUser.userId || 'ADMIN',
+              userRole: currentUser.role || 'Admin'
+            })
+          });
+        } catch (err) {
+          console.warn('[Supervisor] Server sync pending:', err);
+        }
+      }
+
+      this.showToast(`Supervisor ${supName} enrolled!`, 'success');
+      this.renderSupervisorsView(document.getElementById('view-content-root'));
+    });
+  }
+
+  /* ==========================================================================
+     ADMIN MODULE 3: LANDOWNER ENROLLMENT
+     ========================================================================== */
+  async renderLandownersView(container) {
+    const [landowners, locations, supervisors] = await Promise.all([
+      db.getAll('landowners'),
+      db.getAll('locations'),
+      db.getAll('supervisors')
+    ]);
+
+    container.innerHTML = `
+      <div class="content-card">
+        <div class="card-header">
+          <h3 class="card-title">Landowner Enrollment</h3>
+        </div>
+        <div class="card-body">
+          <form id="enroll-lnd-form">
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label required">Landowner ID</label>
+                <input type="text" id="lnd-id-input" class="form-control" placeholder="e.g. LND-001" required />
+              </div>
+              <div class="form-group">
+                <label class="form-label required">Landowner Full Name</label>
+                <input type="text" id="lnd-name-input" class="form-control" placeholder="e.g. Don Ramon Agricultural Estate" required />
+              </div>
+              <div class="form-group">
+                <label class="form-label required">Assigned Work Location</label>
+                <select id="lnd-loc-select" class="form-control" required>
+                  <option value="">Select Location</option>
+                  ${locations.map((loc) => `<option value="${loc.locationId}" data-name="${this.escape(loc.workLocationName)}">${this.escape(loc.workLocationName)}</option>`).join('')}
+                </select>
+              </div>
+            </div>
+
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label required">Assigned Supervisor</label>
+                <select id="lnd-sup-select" class="form-control" required>
+                  <option value="">Select Supervisor</option>
+                  ${supervisors.map((s) => `<option value="${s.supervisorId}">${this.escape(s.supervisorName)}</option>`).join('')}
+                </select>
+              </div>
+              <div class="form-group">
+                <label class="form-label required">Status</label>
+                <select id="lnd-status-select" class="form-control">
+                  <option value="Active">Active</option>
+                  <option value="Inactive">Inactive</option>
+                </select>
+              </div>
+            </div>
+
+            <div style="text-align: right; margin-top: 10px;">
+              <button type="submit" class="btn btn-primary">Enroll Landowner</button>
+            </div>
+          </form>
+        </div>
+      </div>
+
+      <div class="content-card">
+        <div class="card-header">
+          <h3 class="card-title">Landowners Directory (${landowners.length})</h3>
+        </div>
+        <div class="card-body" style="padding: 0;">
+          <div class="table-responsive">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Landowner ID</th>
+                  <th>Full Name</th>
+                  <th>Assigned Location</th>
+                  <th>Assigned Supervisor ID</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${landowners.map((l) => `
+                  <tr>
+                    <td><span class="emp-id-badge">${this.escape(l.landownerId)}</span></td>
+                    <td><strong>${this.escape(l.landownerName)}</strong></td>
+                    <td>${this.escape(l.workLocation || '-')}</td>
+                    <td>${this.escape(l.supervisorId || '-')}</td>
+                    <td><span class="status-pill ${l.status === 'Active' ? 'status-online' : 'status-offline'}">${l.status}</span></td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    `;
+
+    document.getElementById('enroll-lnd-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const lndId = document.getElementById('lnd-id-input').value.trim();
+      const lndName = document.getElementById('lnd-name-input').value.trim();
+      const locSelect = document.getElementById('lnd-loc-select');
+      const locationId = locSelect.value;
+      const workLocation = locSelect.options[locSelect.selectedIndex]?.getAttribute('data-name') || '';
+      const supervisorId = document.getElementById('lnd-sup-select').value;
+      const status = document.getElementById('lnd-status-select').value;
+
+      const landownerObj = {
+        landownerId: lndId,
+        landownerName: lndName,
+        locationId: locationId,
+        workLocation: workLocation,
+        supervisorId: supervisorId,
+        status: status
+      };
+
+      await db.put('landowners', landownerObj);
+
+      const apiUrl = await db.getSetting('apiUrl', '');
+      if (navigator.onLine && apiUrl) {
+        try {
+          const currentUser = auth.getCurrentUser() || {};
+          await fetch(apiUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+            body: JSON.stringify({
+              action: 'SAVE_LANDOWNER',
+              landowner: landownerObj,
+              userId: currentUser.userId || 'ADMIN',
+              userRole: currentUser.role || 'Admin'
+            })
+          });
+        } catch (err) {
+          console.warn('[Landowner] Server sync pending:', err);
+        }
+      }
+
+      this.showToast(`Landowner ${lndName} saved!`, 'success');
+      this.renderLandownersView(document.getElementById('view-content-root'));
+    });
+  }
+
+  /* ==========================================================================
+     ADMIN MODULE 4: WORK LOCATION ENROLLMENT
+     ========================================================================== */
+  async renderLocationsView(container) {
+    const [locations, landowners, supervisors] = await Promise.all([
+      db.getAll('locations'),
+      db.getAll('landowners'),
+      db.getAll('supervisors')
+    ]);
+
+    container.innerHTML = `
+      <div class="content-card">
+        <div class="card-header">
+          <h3 class="card-title">Work Location Enrollment</h3>
+        </div>
+        <div class="card-body">
+          <form id="enroll-loc-form">
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label required">Location ID</label>
+                <input type="text" id="loc-id-input" class="form-control" placeholder="e.g. LOC-001" required />
+              </div>
+              <div class="form-group">
+                <label class="form-label required">Work Location Name</label>
+                <input type="text" id="loc-name-input" class="form-control" placeholder="e.g. North Plantation Block A" required />
+              </div>
+              <div class="form-group">
+                <label class="form-label">Description</label>
+                <input type="text" id="loc-desc-input" class="form-control" placeholder="e.g. Citrus Groves section" />
+              </div>
+            </div>
+
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label">Landowner Name</label>
+                <select id="loc-lnd-select" class="form-control">
+                  <option value="">Select Landowner (Optional)</option>
+                  ${landowners.map((l) => `<option value="${l.landownerId}" data-name="${this.escape(l.landownerName)}">${this.escape(l.landownerName)}</option>`).join('')}
+                </select>
+              </div>
+              <div class="form-group">
+                <label class="form-label">Assigned Supervisor</label>
+                <select id="loc-sup-select" class="form-control">
+                  <option value="">Select Supervisor (Optional)</option>
+                  ${supervisors.map((s) => `<option value="${s.supervisorId}">${this.escape(s.supervisorName)}</option>`).join('')}
+                </select>
+              </div>
+              <div class="form-group">
+                <label class="form-label required">Location Status</label>
+                <select id="loc-status-select" class="form-control">
+                  <option value="Active">Active</option>
+                  <option value="Inactive">Inactive</option>
+                </select>
+              </div>
+            </div>
+
+            <div style="text-align: right; margin-top: 10px;">
+              <button type="submit" class="btn btn-primary">Enroll Location</button>
+            </div>
+          </form>
+        </div>
+      </div>
+
+      <div class="content-card">
+        <div class="card-header">
+          <h3 class="card-title">Work Locations Directory (${locations.length})</h3>
+        </div>
+        <div class="card-body" style="padding: 0;">
+          <div class="table-responsive">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Location ID</th>
+                  <th>Location Name</th>
+                  <th>Description</th>
+                  <th>Landowner</th>
+                  <th>Supervisor ID</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${locations.map((loc) => `
+                  <tr>
+                    <td><span class="emp-id-badge">${this.escape(loc.locationId)}</span></td>
+                    <td><strong>${this.escape(loc.workLocationName)}</strong></td>
+                    <td>${this.escape(loc.description || '-')}</td>
+                    <td>${this.escape(loc.landownerName || '-')}</td>
+                    <td>${this.escape(loc.supervisorId || '-')}</td>
+                    <td><span class="status-pill ${loc.status === 'Active' ? 'status-online' : 'status-offline'}">${loc.status}</span></td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    `;
+
+    document.getElementById('enroll-loc-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const locId = document.getElementById('loc-id-input').value.trim();
+      const locName = document.getElementById('loc-name-input').value.trim();
+      const desc = document.getElementById('loc-desc-input').value.trim();
+      const lndSelect = document.getElementById('loc-lnd-select');
+      const landownerId = lndSelect.value;
+      const landownerName = lndSelect.options[lndSelect.selectedIndex]?.getAttribute('data-name') || '';
+      const supervisorId = document.getElementById('loc-sup-select').value;
+      const status = document.getElementById('loc-status-select').value;
+
+      const locObj = {
+        locationId: locId,
+        workLocationName: locName,
+        description: desc,
+        landownerId: landownerId,
+        landownerName: landownerName,
+        supervisorId: supervisorId,
+        status: status
+      };
+
+      await db.put('locations', locObj);
+
+      const apiUrl = await db.getSetting('apiUrl', '');
+      if (navigator.onLine && apiUrl) {
+        try {
+          const currentUser = auth.getCurrentUser() || {};
+          await fetch(apiUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+            body: JSON.stringify({
+              action: 'SAVE_LOCATION',
+              location: locObj,
+              userId: currentUser.userId || 'ADMIN',
+              userRole: currentUser.role || 'Admin'
+            })
+          });
+        } catch (err) {
+          console.warn('[Location] Server sync pending:', err);
+        }
+      }
+
+      this.showToast(`Location ${locName} saved!`, 'success');
+      this.renderLocationsView(document.getElementById('view-content-root'));
+    });
+  }
+
+  /* ==========================================================================
+     ADMIN MODULE 5: USER ACCOUNTS & MANAGEMENT
+     ========================================================================== */
+  async renderUsersView(container) {
+    const users = await db.getAll('users');
+
+    container.innerHTML = `
+      <div class="content-card">
+        <div class="card-header">
+          <h3 class="card-title">User Accounts & Authentication</h3>
+        </div>
+        <div class="card-body">
+          <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 16px;">
+            Manage credentials for Administrators and Supervisors. Passwords are encrypted with SHA-256 both offline and online.
+          </p>
+          <div class="table-responsive">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>User ID</th>
+                  <th>Username</th>
+                  <th>Role</th>
+                  <th>Linked Supervisor</th>
+                  <th>Status</th>
+                  <th>Last Login</th>
+                  <th>Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${users.map((u) => `
+                  <tr>
+                    <td><small style="font-family: monospace;">${this.escape(u.userId)}</small></td>
+                    <td><strong>${this.escape(u.username)}</strong></td>
+                    <td><span class="status-pill status-online">${u.role}</span></td>
+                    <td>${this.escape(u.linkedSupervisorId || 'None (Admin)')}</td>
+                    <td><span class="status-pill ${u.accountStatus === 'Active' ? 'status-online' : 'status-offline'}">${u.accountStatus}</span></td>
+                    <td><small>${this.escape(u.lastLogin || 'Never')}</small></td>
+                    <td>
+                      <button class="btn btn-outline" style="padding: 4px 8px; font-size: 11px;" onclick="app.promptResetPassword('${u.username}')">Reset Password</button>
+                    </td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  async promptResetPassword(username) {
+    const newPass = prompt(`Enter new password for ${username}:`);
+    if (!newPass || !newPass.trim()) return;
+
+    const hash = await auth.hashPassword(newPass.trim());
+    const users = await db.getAll('users');
+    const user = users.find((u) => u.username === username);
+
+    if (user) {
+      user.passwordHash = hash;
+      await db.put('users', user);
+
+      const apiUrl = await db.getSetting('apiUrl', '');
+      if (navigator.onLine && apiUrl) {
+        try {
+          await fetch(apiUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+            body: JSON.stringify({
+              action: 'SAVE_USER',
+              user: user,
+              userId: auth.getCurrentUser()?.userId || 'ADMIN',
+              userRole: 'Admin'
+            })
+          });
+        } catch (e) {
+          console.warn('[User] Server update failed:', e);
+        }
+      }
+
+      this.showToast(`Password updated for user ${username}.`, 'success');
+      this.renderUsersView(document.getElementById('view-content-root'));
+    }
+  }
+
+  /* ==========================================================================
+     ADMIN MODULE 6: AUDIT TRAIL LOGS
+     ========================================================================== */
+  async renderAuditView(container) {
+    const localLogs = await db.getAll('auditLogs');
+    localLogs.sort((a, b) => (b.dateTime > a.dateTime ? 1 : -1));
+
+    container.innerHTML = `
+      <div class="content-card">
+        <div class="card-header">
+          <h3 class="card-title">System Audit Logs & Adjustments</h3>
+          <span class="status-pill status-online">${localLogs.length} Entries</span>
+        </div>
+        <div class="card-body" style="padding: 0;">
+          <div class="table-responsive">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Timestamp</th>
+                  <th>Action</th>
+                  <th>User ID / Role</th>
+                  <th>Record ID</th>
+                  <th>Reason / Details</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${localLogs.length === 0 ? `<tr><td colspan="5" style="text-align: center; padding: 32px; color: var(--text-muted);">No audit entries yet. Adjustments and deletions appear here.</td></tr>` : localLogs.map((log) => `
+                  <tr>
+                    <td><small>${this.escape(log.dateTime || '-')}</small></td>
+                    <td><strong>${this.escape(log.action)}</strong></td>
+                    <td>${this.escape(log.userId || '-')} (${this.escape(log.userRole || '-')})</td>
+                    <td><small style="font-family: monospace;">${this.escape(log.recordId || '-')}</small></td>
+                    <td>${this.escape(log.reason || '-')}</td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  /* ==========================================================================
+     SETTINGS & API CONFIGURATION MODAL
+     ========================================================================== */
+  async openSettingsModal() {
+    const modal = document.getElementById('settings-modal');
+    const input = document.getElementById('settings-api-url');
+    if (!modal || !input) return;
+
+    const currentUrl = await db.getSetting('apiUrl', '');
+    input.value = currentUrl;
+
+    document.getElementById('save-settings-btn').onclick = async () => {
+      const newUrl = input.value.trim();
+      await db.setSetting('apiUrl', newUrl);
+      this.showToast('Google Apps Script API URL saved.', 'success');
+      this.closeModal('settings-modal');
+
+      if (newUrl && navigator.onLine) {
+        syncService.pullRemoteData();
+      }
+    };
+
+    document.getElementById('test-api-btn').onclick = async () => {
+      const testUrl = input.value.trim();
+      if (!testUrl) {
+        alert('Please enter a Google Apps Script Web App URL first.');
+        return;
+      }
+      const testStatusEl = document.getElementById('settings-test-status');
+      testStatusEl.textContent = 'Testing connection...';
+      testStatusEl.style.color = 'var(--text-muted)';
+
+      try {
+        const res = await fetch(testUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+          body: JSON.stringify({ action: 'SETUP_DB' })
+        });
+        const data = await res.json();
+        if (data && data.success) {
+          testStatusEl.textContent = '✓ Connected successfully! Google Sheets database is ready.';
+          testStatusEl.style.color = 'var(--primary)';
+        } else {
+          testStatusEl.textContent = `Server responded: ${data.error || 'Unknown error'}`;
+          testStatusEl.style.color = 'var(--accent-red)';
+        }
+      } catch (err) {
+        testStatusEl.textContent = `Connection failed: ${err.message}. Check Web App deployment permissions (set to 'Anyone').`;
+        testStatusEl.style.color = 'var(--accent-red)';
+      }
+    };
+
+    this.openModal('settings-modal');
+  }
+
+  // Modal Helpers
+  openModal(modalId) {
+    const modal = document.getElementById(modalId);
+    if (modal) modal.classList.add('active');
+  }
+
+  closeModal(modalId) {
+    const modal = document.getElementById(modalId);
+    if (modal) modal.classList.remove('active');
+  }
+
+  // HTML Entity Escaper for XSS safety
+  escape(str) {
+    if (str === null || str === undefined) return '';
+    return String(str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+}
+
+// Global App Instance
+const app = new AttendanceApp();
+
+// Initialize on DOM load
+window.addEventListener('DOMContentLoaded', () => {
+  app.init();
+});
