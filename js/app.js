@@ -11,6 +11,40 @@ class AttendanceApp {
     this.currentEditEmployee = null;
     this.currentAdjustRecord = null;
     this.sessionLandowner = null; // Active Landowner for area checking { id, name, workLocation }
+    this.adminDash = null;        // Remembers the admin dashboard date / filters
+    this.leaveEmployeeId = null;
+    this.lastDataPull = null;
+  }
+
+  /* ---------- Date / status helpers ---------- */
+  fmtLocalDate(d) {
+    const p = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+  }
+
+  // Today's date in the DEVICE's local time zone (yyyy-MM-dd).
+  // (toISOString() uses UTC, which is the previous day before 8:00 AM in the Philippines.)
+  todayStr() {
+    return this.fmtLocalDate(new Date());
+  }
+
+  shiftDate(ymdStr, days) {
+    const [y, m, d] = ymdStr.split('-').map(Number);
+    return this.fmtLocalDate(new Date(y, m - 1, d + days));
+  }
+
+  ymd(v) {
+    if (!v) return '';
+    if (typeof v === 'string') return v.slice(0, 10);
+    try { return this.fmtLocalDate(new Date(v)); } catch (e) { return ''; }
+  }
+
+  isLeave(r) {
+    return !!r && String(r.attendanceType || '').toUpperCase() === 'LEAVE';
+  }
+
+  csvCell(v) {
+    return `"${String(v === null || v === undefined ? '' : v).replace(/"/g, '""')}"`;
   }
 
   async init() {
@@ -138,6 +172,7 @@ class AttendanceApp {
       this.showToast(`Sync issue: ${event.error}`, 'error');
       this.refreshCurrentView();
     } else if (event.type === 'DATA_PULLED') {
+      this.lastDataPull = new Date();
       this.refreshCurrentView();
     }
   }
@@ -367,10 +402,12 @@ class AttendanceApp {
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
         <span>Dashboard</span>
       </div>
+      ${isAdmin ? '' : `
       <div class="nav-item ${this.currentView === 'attendance' ? 'active' : ''}" onclick="app.navigateTo('attendance')">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
         <span>Record Attendance</span>
       </div>
+      `}
       <div class="nav-item ${this.currentView === 'history' ? 'active' : ''}" onclick="app.navigateTo('history')">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
         <span>Attendance History</span>
@@ -420,10 +457,12 @@ class AttendanceApp {
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
           <span>Home</span>
         </div>
+        ${isAdmin ? '' : `
         <div class="bottom-nav-item ${this.currentView === 'attendance' ? 'active' : ''}" onclick="app.navigateTo('attendance')">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
           <span>Record</span>
         </div>
+        `}
         <div class="bottom-nav-item ${this.currentView === 'history' ? 'active' : ''}" onclick="app.navigateTo('history')">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
           <span>History</span>
@@ -487,6 +526,13 @@ class AttendanceApp {
         break;
 
       case 'attendance':
+        if (auth.isAdmin()) {
+          this.currentView = 'dashboard';
+          this.renderNavigation();
+          if (titleEl) titleEl.textContent = 'Administrator Dashboard';
+          this.renderDashboard(container);
+          break;
+        }
         if (titleEl) titleEl.textContent = 'Record Attendance';
         this.renderAttendanceRecording(container);
         break;
@@ -649,6 +695,9 @@ class AttendanceApp {
      DASHBOARD VIEW (ADMIN & SUPERVISOR)
      ========================================================================== */
   async renderDashboard(container) {
+    if (auth.isAdmin()) {
+      return this.renderAdminDashboard(container);
+    }
     container.innerHTML = `<div style="text-align: center; padding: 40px; color: var(--text-muted);">Loading dashboard data...</div>`;
 
     const isAdmin = auth.isAdmin();
@@ -664,7 +713,7 @@ class AttendanceApp {
     ]);
 
     // Role filtering: supervisors ONLY see their assigned data!
-    let employees = allEmployees;
+    let employees = allEmployees.filter((e) => (e.employmentStatus || 'Active') === 'Active');
     let attendance = allAttendance.filter((a) => a.recordStatus !== 'DELETED');
     let landowners = allLandowners;
     let locations = allLocations;
@@ -676,13 +725,14 @@ class AttendanceApp {
       locations = allLocations.filter((loc) => (loc.supervisorId || '').toString() === supervisorId.toString());
     }
 
-    const todayDate = new Date().toISOString().split('T')[0];
-    const todayRecords = attendance.filter((a) => a.attendanceDate === todayDate);
+    const todayDate = this.todayStr();
+    const todayRecords = attendance.filter((a) => this.ymd(a.attendanceDate) === todayDate);
 
     const totalEmployeesCount = employees.length;
-    const presentTodayCount = todayRecords.filter((a) => !!a.timeIn).length;
+    const presentTodayCount = todayRecords.filter((a) => !this.isLeave(a) && !!a.timeIn).length;
+    const leaveTodayCount = todayRecords.filter((a) => this.isLeave(a)).length;
     const clockedOutTodayCount = todayRecords.filter((a) => !!a.timeOut).length;
-    const notYetRecordedCount = Math.max(0, totalEmployeesCount - presentTodayCount);
+    const notYetRecordedCount = Math.max(0, totalEmployeesCount - presentTodayCount - leaveTodayCount);
 
     const pendingSyncCount = syncStats.pendingRecords + syncStats.failedRecords;
     const syncedCount = syncStats.syncedRecords;
@@ -723,6 +773,16 @@ class AttendanceApp {
             </div>
           </div>
           <div class="metric-value" style="color: var(--primary);">${presentTodayCount}</div>
+        </div>
+
+        <div class="metric-card">
+          <div class="metric-card-header">
+            <span class="metric-title">On Leave Today</span>
+            <div class="metric-icon icon-amber">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+            </div>
+          </div>
+          <div class="metric-value" style="color: #b45309;">${leaveTodayCount}</div>
         </div>
 
         <div class="metric-card">
@@ -800,7 +860,7 @@ class AttendanceApp {
                       <td><strong>${this.escape(r.employeeName)}</strong></td>
                       <td>${this.escape(r.workLocation || '-')}</td>
                       <td>${this.escape(r.landownerName || '-')}</td>
-                      <td><strong style="color: var(--primary);">${this.escape(r.timeIn || '-')}</strong></td>
+                      <td>${this.isLeave(r) ? `<span class="status-pill badge-leave">On Leave${r.leaveType ? ' – ' + this.escape(r.leaveType) : ''}</span>` : `<strong style="color: var(--primary);">${this.escape(r.timeIn || '-')}</strong>`}</td>
                       <td>${this.escape(r.timeOut || '-')}</td>
                       <td><small style="color: var(--text-muted);">${this.escape(r.actualGpsIn || '-')}</small></td>
                       <td><span class="status-pill badge-${(r.syncStatus || 'PENDING').toLowerCase()}">${r.syncStatus}</span></td>
@@ -813,6 +873,547 @@ class AttendanceApp {
         </div>
       </div>
     `;
+  }
+
+  /* ==========================================================================
+     ADMIN DASHBOARD (SUMMARY ONLY - NO RECORDING)
+     ========================================================================== */
+  getAdminDashState() {
+    if (!this.adminDash) {
+      this.adminDash = { date: this.todayStr(), supervisorId: '', location: '' };
+    }
+    return this.adminDash;
+  }
+
+  // Work out PRESENT / LEAVE / ABSENT for every employee on one date
+  computeDayStatuses(employees, recsForDate, date) {
+    const byEmp = new Map();
+    recsForDate.forEach((r) => {
+      const key = String(r.employeeId);
+      const prev = byEmp.get(key);
+      // if an employee has both a leave entry and a punch, the punch wins (they actually came)
+      if (!prev || (this.isLeave(prev) && !this.isLeave(r))) byEmp.set(key, r);
+    });
+    const isFuture = date > this.todayStr();
+    return employees.map((emp) => {
+      const rec = byEmp.get(String(emp.employeeId)) || null;
+      let status;
+      if (rec && this.isLeave(rec)) status = 'LEAVE';
+      else if (rec && rec.timeIn) status = 'PRESENT';
+      else status = isFuture ? 'NONE' : 'ABSENT';
+      return { emp, rec, status };
+    });
+  }
+
+  donutSvg(segments, total, centerBig, centerSmall) {
+    const r = 70, cx = 90, cy = 90, sw = 28;
+    const C = 2 * Math.PI * r;
+    let offset = 0;
+    let rings = `<circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="#e2e8f0" stroke-width="${sw}"/>`;
+    if (total > 0) {
+      segments.forEach((seg) => {
+        if (seg.value <= 0) return;
+        const len = (seg.value / total) * C;
+        rings += `<circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="${seg.color}" stroke-width="${sw}"
+          stroke-dasharray="${len} ${C - len}" stroke-dashoffset="${-offset}" transform="rotate(-90 ${cx} ${cy})"><title>${this.escape(seg.label)}: ${seg.value}</title></circle>`;
+        offset += len;
+      });
+    }
+    return `
+      <svg viewBox="0 0 180 180" class="donut-svg" role="img" aria-label="Attendance pie chart">
+        ${rings}
+        <text x="${cx}" y="${cy + 4}" text-anchor="middle" font-size="28" font-weight="700" fill="#0f172a">${centerBig}</text>
+        <text x="${cx}" y="${cy + 24}" text-anchor="middle" font-size="11" fill="#64748b">${centerSmall}</text>
+      </svg>`;
+  }
+
+  trendSvg(days) {
+    // days: [{date, present, leave, absent, total}]
+    const W = 340, H = 150, padL = 4, padB = 26, padT = 8;
+    const bw = 30, gap = (W - padL * 2 - bw * days.length) / Math.max(1, days.length - 1);
+    const maxH = H - padB - padT;
+    let bars = '';
+    days.forEach((d, i) => {
+      const x = padL + i * (bw + gap);
+      const t = Math.max(1, d.total);
+      const hp = (d.present / t) * maxH;
+      const hl = (d.leave / t) * maxH;
+      const ha = (d.absent / t) * maxH;
+      let y = H - padB;
+      const seg = (h, color) => { if (h <= 0) return ''; y -= h; return `<rect x="${x}" y="${y}" width="${bw}" height="${h}" fill="${color}" rx="2"/>`; };
+      const noData = d.present + d.leave === 0;
+      const dt = new Date(d.date + 'T00:00:00');
+      const lbl = dt.toLocaleDateString([], { weekday: 'short' });
+      bars += `<g><title>${d.date}: ${noData ? 'no records' : d.present + ' present, ' + d.leave + ' on leave, ' + d.absent + ' absent'}</title>
+        ${noData ? `<rect x="${x}" y="${H - padB - 6}" width="${bw}" height="6" fill="#e2e8f0" rx="2"/>` : seg(hp, '#16a34a') + seg(hl, '#f59e0b') + seg(ha, '#fca5a5')}
+        <text x="${x + bw / 2}" y="${H - 12}" text-anchor="middle" font-size="10" fill="#64748b">${lbl}</text>
+        <text x="${x + bw / 2}" y="${H - 1}" text-anchor="middle" font-size="9" fill="#94a3b8">${dt.getDate()}</text></g>`;
+    });
+    return `<svg viewBox="0 0 ${W} ${H}" class="trend-svg" role="img" aria-label="7 day attendance trend">${bars}</svg>`;
+  }
+
+  async renderAdminDashboard(container) {
+    const state = this.getAdminDashState();
+    if (!container.querySelector('#admin-dash-root')) {
+      container.innerHTML = `<div style="text-align: center; padding: 40px; color: var(--text-muted);">Loading dashboard data...</div>`;
+    }
+
+    const [allEmployees, supervisors, allAttendance, syncStats] = await Promise.all([
+      db.getAll('employees'),
+      db.getAll('supervisors'),
+      db.getAll('attendance'),
+      syncService.getSyncStats()
+    ]);
+
+    const supName = new Map(supervisors.map((s) => [String(s.supervisorId), s.supervisorName]));
+    const supLabel = (emp) => supName.get(String(emp.supervisorId || '')) || emp.supervisorName || 'Unassigned';
+
+    // Only active employees count
+    const activeEmployees = allEmployees.filter((e) => (e.employmentStatus || 'Active') === 'Active');
+
+    const locations = [...new Set(activeEmployees.map((e) => e.workLocation).filter(Boolean))].sort();
+    const supOptions = [...supervisors].sort((a, b) => String(a.supervisorName).localeCompare(String(b.supervisorName)));
+
+    // Apply filters
+    let employees = activeEmployees;
+    if (state.supervisorId) employees = employees.filter((e) => String(e.supervisorId || '') === String(state.supervisorId));
+    if (state.location) employees = employees.filter((e) => (e.workLocation || '') === state.location);
+
+    // Group attendance by date once
+    const attByDate = new Map();
+    allAttendance.forEach((r) => {
+      if (r.recordStatus === 'DELETED') return;
+      const d = this.ymd(r.attendanceDate);
+      if (!attByDate.has(d)) attByDate.set(d, []);
+      attByDate.get(d).push(r);
+    });
+
+    const date = state.date;
+    const isFuture = date > this.todayStr();
+    const rows = this.computeDayStatuses(employees, attByDate.get(date) || [], date);
+
+    const count = (st) => rows.filter((x) => x.status === st).length;
+    const total = rows.length;
+    const present = count('PRESENT');
+    const leave = count('LEAVE');
+    const absent = count('ABSENT');
+    const pct = (n, t) => (t > 0 ? Math.round((n / t) * 100) : 0);
+
+    // Per supervisor
+    const groups = new Map();
+    rows.forEach((x) => {
+      const key = String(x.emp.supervisorId || '');
+      if (!groups.has(key)) groups.set(key, { id: key, name: supLabel(x.emp), items: [] });
+      groups.get(key).items.push(x);
+    });
+    const groupList = [...groups.values()].sort((a, b) => a.name.localeCompare(b.name));
+    this.adminDashData = { groups: groupList, date, isFuture };
+
+    const supRowsHtml = groupList.map((g) => {
+      const p = g.items.filter((x) => x.status === 'PRESENT').length;
+      const l = g.items.filter((x) => x.status === 'LEAVE').length;
+      const a = g.items.filter((x) => x.status === 'ABSENT').length;
+      const rate = pct(p, g.items.length);
+      return `
+        <tr class="clickable-row" onclick="app.showSupervisorDetail('${this.escape(g.id)}')">
+          <td><strong>${this.escape(g.name)}</strong></td>
+          <td>${g.items.length}</td>
+          <td><strong style="color: var(--primary);">${p}</strong></td>
+          <td><strong style="color: #b45309;">${l}</strong></td>
+          <td><strong style="color: var(--accent-red);">${isFuture ? '-' : a}</strong></td>
+          <td><div class="pct-cell"><span>${rate}%</span><div class="bar"><i style="width: ${rate}%;"></i></div></div></td>
+          <td><button class="btn btn-outline view-btn" onclick="event.stopPropagation(); app.showSupervisorDetail('${this.escape(g.id)}')">View ›</button></td>
+        </tr>`;
+    }).join('');
+
+    // Absent follow-up list (grouped by supervisor)
+    const absentGroups = groupList
+      .map((g) => ({ name: g.name, items: g.items.filter((x) => x.status === 'ABSENT') }))
+      .filter((g) => g.items.length > 0);
+
+    // 7-day trend ending on selected date
+    const trendDays = [];
+    for (let i = 6; i >= 0; i--) {
+      const d = this.shiftDate(date, -i);
+      const st = this.computeDayStatuses(employees, attByDate.get(d) || [], d);
+      const p = st.filter((x) => x.status === 'PRESENT').length;
+      const l = st.filter((x) => x.status === 'LEAVE').length;
+      const a = st.filter((x) => x.status === 'ABSENT').length;
+      trendDays.push({ date: d, present: p, leave: l, absent: a, total: st.length });
+    }
+
+    const prettyDate = new Date(date + 'T00:00:00').toLocaleDateString([], { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+    const updatedText = this.lastDataPull
+      ? `Updated ${this.lastDataPull.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
+      : 'Showing data saved on this device';
+    const pendingCount = syncStats.pendingRecords + syncStats.failedRecords;
+
+    container.innerHTML = `
+      <div id="admin-dash-root">
+        <div class="toolbar admin-tools">
+          <div class="date-controls">
+            <button class="btn btn-outline btn-icon" onclick="app.adminDashShiftDate(-1)" title="Previous day">‹</button>
+            <input type="date" id="admin-dash-date" class="select-filter" value="${date}" onchange="app.adminDashSetDate(this.value)" />
+            <button class="btn btn-outline btn-icon" onclick="app.adminDashShiftDate(1)" title="Next day">›</button>
+            <button class="btn btn-outline" onclick="app.adminDashSetDate(app.todayStr())">Today</button>
+          </div>
+
+          <select id="admin-dash-sup" class="select-filter" onchange="app.adminDashSetFilter('supervisorId', this.value)">
+            <option value="">All Supervisors</option>
+            ${supOptions.map((s) => `<option value="${this.escape(s.supervisorId)}" ${String(state.supervisorId) === String(s.supervisorId) ? 'selected' : ''}>${this.escape(s.supervisorName)}</option>`).join('')}
+          </select>
+
+          <select id="admin-dash-loc" class="select-filter" onchange="app.adminDashSetFilter('location', this.value)">
+            <option value="">All Work Locations</option>
+            ${locations.map((l) => `<option value="${this.escape(l)}" ${state.location === l ? 'selected' : ''}>${this.escape(l)}</option>`).join('')}
+          </select>
+
+          <button class="btn btn-outline" onclick="app.refreshAdminDashboard()">↻ Refresh</button>
+          <button class="btn btn-outline" onclick="app.exportDayReport()">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            Export CSV
+          </button>
+        </div>
+
+        <div class="dash-subtitle"><strong>${this.escape(prettyDate)}</strong> · <span>${this.escape(updatedText)}</span>${isFuture ? ' · <span style="color: #b45309;">Future date: absences are not counted yet</span>' : ''}${(!isFuture && rows.length > 0 && rows.every((x) => !x.rec)) ? ' · <span style="color: #b45309;">No attendance records for this day (not synced yet, or no work)</span>' : ''}</div>
+
+        <div class="metrics-grid five">
+          <div class="metric-card">
+            <div class="metric-card-header"><span class="metric-title">Total Employees</span>
+              <div class="metric-icon icon-blue"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg></div></div>
+            <div class="metric-value">${total}</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-card-header"><span class="metric-title">Present</span>
+              <div class="metric-icon icon-green"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg></div></div>
+            <div class="metric-value" style="color: var(--primary);">${present}</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-card-header"><span class="metric-title">On Leave</span>
+              <div class="metric-icon icon-amber"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="3" y1="10" x2="21" y2="10"/></svg></div></div>
+            <div class="metric-value" style="color: #b45309;">${leave}</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-card-header"><span class="metric-title">Absent</span>
+              <div class="metric-icon icon-red"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg></div></div>
+            <div class="metric-value" style="color: var(--accent-red);">${isFuture ? '-' : absent}</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-card-header"><span class="metric-title">Pending Upload</span>
+              <div class="metric-icon icon-amber"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10"/></svg></div></div>
+            <div class="metric-value">${pendingCount}</div>
+          </div>
+        </div>
+
+        ${total === 0 ? `
+          <div class="content-card" style="padding: 40px; text-align: center; color: var(--text-muted);">
+            No active employees match the selected filters.
+          </div>
+        ` : `
+        <div class="dash-grid">
+          <div class="content-card">
+            <div class="card-header"><h3 class="card-title">Attendance Overview</h3></div>
+            <div class="card-body donut-wrap">
+              ${this.donutSvg([
+                { label: 'Present', value: present, color: '#16a34a' },
+                { label: 'On Leave', value: leave, color: '#f59e0b' },
+                { label: 'Absent', value: absent, color: '#ef4444' }
+              ], isFuture ? present + leave : total, `${pct(present, total)}%`, 'Present')}
+              <div class="legend">
+                <div><i style="background: #16a34a;"></i> Present <strong>${present}</strong> <span>${pct(present, total)}%</span></div>
+                <div><i style="background: #f59e0b;"></i> On Leave <strong>${leave}</strong> <span>${pct(leave, total)}%</span></div>
+                <div><i style="background: #ef4444;"></i> Absent <strong>${isFuture ? '-' : absent}</strong> <span>${isFuture ? '' : pct(absent, total) + '%'}</span></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="content-card">
+            <div class="card-header"><h3 class="card-title">Attendance per Supervisor</h3>
+              <span style="font-size: 12px; color: var(--text-muted);">${groupList.length} supervisor(s)</span></div>
+            <div class="card-body" style="padding: 0;">
+              <div class="table-responsive">
+                <table class="data-table keep-table">
+                  <thead>
+                    <tr><th>Supervisor</th><th>Team</th><th>Present</th><th>Leave</th><th>Absent</th><th>Rate</th><th></th></tr>
+                  </thead>
+                  <tbody>
+                    ${supRowsHtml}
+                    <tr class="total-row">
+                      <td><strong>TOTAL</strong></td>
+                      <td><strong>${total}</strong></td>
+                      <td><strong style="color: var(--primary);">${present}</strong></td>
+                      <td><strong style="color: #b45309;">${leave}</strong></td>
+                      <td><strong style="color: var(--accent-red);">${isFuture ? '-' : absent}</strong></td>
+                      <td><div class="pct-cell"><span>${pct(present, total)}%</span><div class="bar"><i style="width: ${pct(present, total)}%;"></i></div></div></td>
+                      <td></td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="dash-grid dash-grid-even">
+          <div class="content-card">
+            <div class="card-header"><h3 class="card-title">Last 7 Days</h3>
+              <span class="trend-legend"><i style="background:#16a34a"></i>Present <i style="background:#f59e0b"></i>Leave <i style="background:#fca5a5"></i>Absent</span></div>
+            <div class="card-body">${this.trendSvg(trendDays)}</div>
+          </div>
+
+          <div class="content-card">
+            <div class="card-header"><h3 class="card-title">Absent – Needs Follow-up</h3>
+              <span class="status-pill ${absent > 0 && !isFuture ? 'badge-failed' : 'badge-synced'}">${isFuture ? 0 : absent}</span></div>
+            <div class="card-body absent-scroll">
+              ${isFuture || absentGroups.length === 0
+                ? `<div style="text-align: center; color: var(--text-muted); padding: 24px;">🎉 No absent employees for this day.</div>`
+                : absentGroups.map((g) => `
+                  <div class="absent-group">
+                    <div class="absent-group-title">${this.escape(g.name)} <span>(${g.items.length})</span></div>
+                    ${g.items.map((x) => `
+                      <div class="absent-row">
+                        <span class="emp-id-badge">${this.escape(x.emp.employeeId)}</span>
+                        <span class="absent-name">${this.escape(x.emp.employeeName)}</span>
+                        <small>${this.escape(x.emp.workLocation || '')}</small>
+                      </div>`).join('')}
+                  </div>`).join('')}
+            </div>
+          </div>
+        </div>
+        `}
+      </div>
+    `;
+
+    // Pull the newest data from Google Sheets when the dashboard is opened (at most once a minute)
+    if (navigator.onLine && Date.now() - (this._lastAdminPull || 0) > 60000) {
+      this._lastAdminPull = Date.now();
+      syncService.pullRemoteData();
+    }
+  }
+
+  adminDashSetDate(value) {
+    if (!value) return;
+    this.getAdminDashState().date = value;
+    this.renderAdminDashboard(document.getElementById('view-content-root'));
+  }
+
+  adminDashShiftDate(days) {
+    const st = this.getAdminDashState();
+    this.adminDashSetDate(this.shiftDate(st.date, days));
+  }
+
+  adminDashSetFilter(key, value) {
+    this.getAdminDashState()[key] = value;
+    this.renderAdminDashboard(document.getElementById('view-content-root'));
+  }
+
+  async refreshAdminDashboard() {
+    if (!navigator.onLine) {
+      this.showToast('You are offline. Showing data saved on this device.', 'warning');
+      return;
+    }
+    this.showToast('Refreshing from Google Sheets...', 'info');
+    await syncService.pullRemoteData();
+    this._lastAdminPull = Date.now();
+    this.showToast('Dashboard updated.', 'success');
+  }
+
+  showSupervisorDetail(supervisorId) {
+    const data = this.adminDashData;
+    if (!data) return;
+    const g = data.groups.find((x) => String(x.id) === String(supervisorId));
+    if (!g) return;
+
+    const section = (title, status, color) => {
+      const list = g.items.filter((x) => x.status === status);
+      return `
+        <div class="detail-section">
+          <div class="detail-title" style="color: ${color};">${title} (${list.length})</div>
+          ${list.length === 0 ? '<div class="detail-empty">None</div>' : list.map((x) => `
+            <div class="detail-row">
+              <div><span class="emp-id-badge">${this.escape(x.emp.employeeId)}</span> <strong>${this.escape(x.emp.employeeName)}</strong>
+                <div style="font-size: 11px; color: var(--text-muted);">${this.escape(x.emp.workLocation || '')}</div></div>
+              <div class="detail-time">
+                ${status === 'PRESENT' ? `${this.escape(x.rec.timeIn || '')}${x.rec.timeOut ? ' – ' + this.escape(x.rec.timeOut) : ''}` : ''}
+                ${status === 'LEAVE' ? this.escape(x.rec.leaveType || 'Leave') : ''}
+              </div>
+            </div>`).join('')}
+        </div>`;
+    };
+
+    document.getElementById('sup-detail-title').textContent = `${g.name} – ${data.date}`;
+    document.getElementById('sup-detail-body').innerHTML =
+      section('Present', 'PRESENT', '#15803d') +
+      section('On Leave', 'LEAVE', '#b45309') +
+      (data.isFuture ? '' : section('Absent', 'ABSENT', '#b91c1c'));
+    this.openModal('sup-detail-modal');
+  }
+
+  exportDayReport() {
+    const data = this.adminDashData;
+    if (!data) return;
+    const headers = ['Date', 'Supervisor', 'Employee ID', 'Employee Name', 'Work Location', 'Status', 'Leave Type', 'Leave Remarks', 'Time IN', 'Time OUT', 'Landowner Area'];
+    const label = { PRESENT: 'Present', LEAVE: 'On Leave', ABSENT: 'Absent', NONE: '' };
+    const lines = [];
+    data.groups.forEach((g) => {
+      g.items.forEach((x) => {
+        lines.push([
+          this.csvCell(data.date),
+          this.csvCell(g.name),
+          `="${String(x.emp.employeeId).replace(/"/g, '')}"`, // keeps leading zeros in Excel
+          this.csvCell(x.emp.employeeName),
+          this.csvCell(x.emp.workLocation || ''),
+          this.csvCell(label[x.status]),
+          this.csvCell(x.rec ? (x.rec.leaveType || '') : ''),
+          this.csvCell(x.rec ? (x.rec.leaveRemarks || '') : ''),
+          this.csvCell(x.rec && !this.isLeave(x.rec) ? (x.rec.timeIn || '') : ''),
+          this.csvCell(x.rec && !this.isLeave(x.rec) ? (x.rec.timeOut || '') : ''),
+          this.csvCell(x.rec && !this.isLeave(x.rec) ? (x.rec.landownerName || '') : '')
+        ].join(','));
+      });
+    });
+    if (lines.length === 0) {
+      alert('Nothing to export for the selected filters.');
+      return;
+    }
+    const csv = '\uFEFF' + [headers.map((h) => this.csvCell(h)).join(','), ...lines].join('\r\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `Attendance_Day_Report_${data.date}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  /* ==========================================================================
+     ON LEAVE (SUPERVISOR)
+     ========================================================================== */
+  async openLeaveModal(employeeId) {
+    const emp = await db.get('employees', employeeId);
+    if (!emp) return;
+    this.leaveEmployeeId = employeeId;
+    const today = this.todayStr();
+
+    document.getElementById('leave-modal-emp').innerHTML = `
+      <div style="font-weight: 700;">${this.escape(emp.employeeName)}</div>
+      <div style="font-size: 12px; color: var(--text-muted);">ID: ${this.escape(emp.employeeId)} | Location: ${this.escape(emp.workLocation || 'None')}</div>`;
+    document.getElementById('leave-type').selectedIndex = 0;
+    document.getElementById('leave-from').value = today;
+    document.getElementById('leave-to').value = '';
+    document.getElementById('leave-remarks').value = '';
+    this.openModal('leave-modal');
+  }
+
+  async saveLeave() {
+    try {
+      const emp = await db.get('employees', this.leaveEmployeeId);
+      if (!emp) throw new Error('Employee not found.');
+
+      const leaveType = document.getElementById('leave-type').value;
+      const from = document.getElementById('leave-from').value;
+      const to = document.getElementById('leave-to').value || from;
+      const remarks = document.getElementById('leave-remarks').value.trim();
+
+      if (!from) throw new Error('Please choose the leave start date.');
+      if (to < from) throw new Error('"To Date" cannot be earlier than "From Date".');
+      if (leaveType === 'Other' && !remarks) throw new Error('Please add a remark for "Other" leave.');
+
+      const dates = [];
+      for (let cur = from; cur <= to; cur = this.shiftDate(cur, 1)) {
+        dates.push(cur);
+        if (dates.length > 31) throw new Error('Leave can cover at most 31 days at a time.');
+      }
+
+      const allAtt = await db.getAll('attendance');
+      const taken = new Set(
+        allAtt
+          .filter((a) => String(a.employeeId) === String(emp.employeeId) && a.recordStatus !== 'DELETED')
+          .map((a) => this.ymd(a.attendanceDate))
+      );
+
+      const currentUser = auth.getCurrentUser() || {};
+      const nowIso = new Date().toISOString();
+      const skipped = [];
+      let created = 0;
+
+      for (const d of dates) {
+        if (taken.has(d)) { skipped.push(d); continue; }
+        await db.put('attendance', {
+          attendanceRecordId: `REC-LV-${Date.now()}-${Math.random().toString(36).substring(2, 7).toUpperCase()}`,
+          employeeId: emp.employeeId,
+          employeeName: emp.employeeName,
+          supervisorId: emp.supervisorId || currentUser.linkedSupervisorId || '',
+          supervisorName: emp.supervisorName || currentUser.name || '',
+          landownerId: '',
+          landownerName: '',
+          locationId: emp.locationId || '',
+          workLocation: emp.workLocation || '',
+          attendanceDate: d,
+          timeIn: '',
+          timeOut: '',
+          originalTimeIn: '',
+          originalTimeOut: '',
+          adjustedBy: '',
+          adjustmentReason: '',
+          actualGpsIn: '',
+          actualGpsOut: '',
+          deviceTimestamp: nowIso,
+          synchronizationDate: '',
+          syncStatus: 'PENDING',
+          recordStatus: 'ACTIVE',
+          attendanceType: 'LEAVE',
+          leaveType: leaveType,
+          leaveRemarks: remarks
+        });
+        created++;
+      }
+
+      this.closeModal('leave-modal');
+
+      if (created === 0) {
+        this.showToast('No leave saved: the employee already has attendance on those date(s).', 'warning');
+      } else {
+        let msg = `${leaveType} saved for ${emp.employeeName} (${created} day${created > 1 ? 's' : ''}).`;
+        if (skipped.length) msg += ` Skipped ${skipped.length} day(s) that already have a record.`;
+        this.showToast(msg, 'success');
+      }
+
+      this.refreshCurrentView();
+      if (navigator.onLine) syncService.autoSync();
+    } catch (err) {
+      this.showToast(err.message, 'error');
+    }
+  }
+
+  async cancelLeave(recordId) {
+    if (!confirm('Cancel this leave entry? The employee will be able to Time IN again.')) return;
+    try {
+      const rec = await db.get('attendance', recordId);
+      if (!rec) throw new Error('Leave record not found.');
+      rec.recordStatus = 'DELETED';
+      rec.syncStatus = 'PENDING';
+      await db.put('attendance', rec);
+
+      const currentUser = auth.getCurrentUser() || {};
+      await db.put('auditLogs', {
+        logId: `LOG-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+        userId: currentUser.userId || 'SYSTEM',
+        userRole: currentUser.role || 'Supervisor',
+        action: 'CANCEL_LEAVE',
+        recordId: recordId,
+        previousValue: 'ACTIVE',
+        newValue: 'DELETED',
+        reason: `${rec.leaveType || 'Leave'} cancelled`,
+        dateTime: new Date().toISOString()
+      });
+
+      this.showToast('Leave cancelled.', 'success');
+      this.refreshCurrentView();
+      if (navigator.onLine) syncService.autoSync();
+    } catch (err) {
+      this.showToast(err.message, 'error');
+    }
   }
 
   /* ==========================================================================
@@ -840,7 +1441,7 @@ class AttendanceApp {
       myLocations = locations.filter((loc) => (loc.supervisorId || '').toString() === supervisorId.toString());
     }
 
-    const todayDate = new Date().toISOString().split('T')[0];
+    const todayDate = this.todayStr();
 
     container.innerHTML = `
       <!-- Active Area Checking Banner for Supervisor -->
@@ -912,15 +1513,18 @@ class AttendanceApp {
     container.innerHTML = filtered.map((emp) => {
       // Find today's active attendance record for this employee
       const todayRec = allAttendance.find(
-        (a) => a.employeeId === emp.employeeId && a.attendanceDate === todayDate && a.recordStatus !== 'DELETED'
+        (a) => String(a.employeeId) === String(emp.employeeId) && this.ymd(a.attendanceDate) === todayDate && a.recordStatus !== 'DELETED'
       );
 
-      const hasTimeIn = todayRec && !!todayRec.timeIn;
+      const isLeave = this.isLeave(todayRec);
+      const hasTimeIn = todayRec && !isLeave && !!todayRec.timeIn;
       const hasTimeOut = todayRec && !!todayRec.timeOut;
       const syncStatus = todayRec ? todayRec.syncStatus : null;
 
       let statusPill = `<span class="status-pill status-offline">Not Recorded</span>`;
-      if (hasTimeIn && !hasTimeOut) {
+      if (isLeave) {
+        statusPill = `<span class="status-pill badge-leave">On Leave</span>`;
+      } else if (hasTimeIn && !hasTimeOut) {
         statusPill = `<span class="status-pill status-online">Clocked IN</span>`;
       } else if (hasTimeIn && hasTimeOut) {
         statusPill = `<span class="status-pill" style="background: #e0f2fe; color: #0369a1;">Clocked OUT</span>`;
@@ -944,8 +1548,15 @@ class AttendanceApp {
             </div>
           </div>
 
+          ${isLeave ? `
+            <div class="leave-info">
+              <strong>🏖 ${this.escape(todayRec.leaveType || 'On Leave')}</strong>
+              ${todayRec.leaveRemarks ? `<div>${this.escape(todayRec.leaveRemarks)}</div>` : ''}
+            </div>
+          ` : ''}
+
           <!-- Times Display -->
-          <div class="emp-time-status">
+          <div class="emp-time-status" ${isLeave ? 'style="display: none;"' : ''}>
             <div>
               <span style="font-size: 11px; color: var(--text-muted); display: block;">TIME IN</span>
               <strong style="color: var(--primary); font-size: 14px;">${todayRec?.timeIn || '--:--'}</strong>
@@ -966,7 +1577,11 @@ class AttendanceApp {
 
           <!-- Large Action Buttons -->
           <div class="emp-actions">
-            ${!hasTimeIn ? `
+            ${isLeave ? `
+              <button class="btn btn-danger" style="flex: 1;" onclick="app.cancelLeave('${todayRec.attendanceRecordId}')">
+                ✕ Cancel Leave
+              </button>
+            ` : !hasTimeIn ? `
               <button class="btn btn-time-in" style="flex: 1;" onclick="app.recordTimeIn('${emp.employeeId}')">
                 <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
                 TIME IN
@@ -983,10 +1598,17 @@ class AttendanceApp {
             `}
 
             <!-- Adjustment Button -->
+            ${isLeave ? '' : `
             <button class="btn btn-outline" title="Adjust date/time with audit trail" onclick="app.openAdjustmentModal('${emp.employeeId}', '${todayRec ? todayRec.attendanceRecordId : ''}')">
               ⚙ Adjust
-            </button>
+            </button>`}
           </div>
+
+          ${(!hasTimeIn && !isLeave) ? `
+            <button class="btn btn-leave" onclick="app.openLeaveModal('${emp.employeeId}')">
+              🏖 Mark On Leave
+            </button>
+          ` : ''}
         </div>
       `;
     }).join('');
@@ -1012,12 +1634,15 @@ class AttendanceApp {
       const emp = await db.get('employees', employeeId);
       if (!emp) throw new Error('Employee not found');
 
-      const todayDate = new Date().toISOString().split('T')[0];
+      const todayDate = this.todayStr();
       const allAtt = await db.getAll('attendance');
       const existing = allAtt.find(
-        (a) => a.employeeId === employeeId && a.attendanceDate === todayDate && a.recordStatus !== 'DELETED'
+        (a) => String(a.employeeId) === String(employeeId) && this.ymd(a.attendanceDate) === todayDate && a.recordStatus !== 'DELETED'
       );
 
+      if (existing && this.isLeave(existing)) {
+        throw new Error('This employee is marked On Leave today. Cancel the leave first to record Time IN.');
+      }
       if (existing && existing.timeIn) {
         throw new Error('Employee already has an active Time IN record for today.');
       }
@@ -1049,7 +1674,8 @@ class AttendanceApp {
         deviceTimestamp: now.toISOString(),
         synchronizationDate: '',
         syncStatus: 'PENDING',
-        recordStatus: 'ACTIVE'
+        recordStatus: 'ACTIVE',
+        attendanceType: 'PRESENT'
       };
 
       await db.put('attendance', newRecord);
@@ -1102,7 +1728,7 @@ class AttendanceApp {
       record = await db.get('attendance', existingRecordId);
     }
 
-    const todayDate = new Date().toISOString().split('T')[0];
+    const todayDate = this.todayStr();
     const nowTimeStr = new Date().toTimeString().substring(0, 5); // HH:MM for time input
 
     const modal = document.getElementById('adjustment-modal');
@@ -1212,7 +1838,8 @@ class AttendanceApp {
           deviceTimestamp: now.toISOString(),
           synchronizationDate: '',
           syncStatus: 'PENDING',
-          recordStatus: 'ACTIVE'
+          recordStatus: 'ACTIVE',
+          attendanceType: 'PRESENT'
         };
         await db.put('attendance', newRecord);
       }
@@ -1270,6 +1897,12 @@ class AttendanceApp {
         <select id="hist-location-filter" class="select-filter" onchange="app.filterHistoryTable()">
           <option value="">All Locations</option>
           ${locations.map((loc) => `<option value="${this.escape(loc.workLocationName)}">${this.escape(loc.workLocationName)}</option>`).join('')}
+        </select>
+
+        <select id="hist-type-filter" class="select-filter" onchange="app.filterHistoryTable()">
+          <option value="">All Types</option>
+          <option value="PRESENT">Present</option>
+          <option value="LEAVE">On Leave</option>
         </select>
 
         <select id="hist-sync-filter" class="select-filter" onchange="app.filterHistoryTable()">
@@ -1333,6 +1966,7 @@ class AttendanceApp {
     const lndVal = document.getElementById('hist-landowner-filter')?.value || '';
     const locVal = document.getElementById('hist-location-filter')?.value || '';
     const syncVal = document.getElementById('hist-sync-filter')?.value || '';
+    const typeVal = document.getElementById('hist-type-filter')?.value || '';
 
     const { records, isAdmin } = this.cachedHistoryData;
 
@@ -1340,11 +1974,12 @@ class AttendanceApp {
       const matchQuery = r.employeeName.toLowerCase().includes(query) ||
                          r.employeeId.toLowerCase().includes(query) ||
                          r.attendanceRecordId.toLowerCase().includes(query);
-      const matchDate = !dateVal || r.attendanceDate === dateVal;
+      const matchDate = !dateVal || this.ymd(r.attendanceDate) === dateVal;
+      const matchType = !typeVal || (typeVal === 'LEAVE' ? this.isLeave(r) : !this.isLeave(r));
       const matchLnd = !lndVal || (r.landownerName || '') === lndVal;
       const matchLoc = !locVal || (r.workLocation || '') === locVal;
       const matchSync = !syncVal || r.syncStatus === syncVal;
-      return matchQuery && matchDate && matchLnd && matchLoc && matchSync;
+      return matchQuery && matchDate && matchType && matchLnd && matchLoc && matchSync;
     });
 
     if (countBadge) countBadge.textContent = `${filtered.length} Records`;
@@ -1363,7 +1998,7 @@ class AttendanceApp {
         <td>${this.escape(r.workLocation || '-')}</td>
         <td>${this.escape(r.landownerName || '-')}</td>
         ${isAdmin ? `<td>${this.escape(r.supervisorName || '-')}</td>` : ''}
-        <td><span style="color: var(--primary); font-weight: 600;">${this.escape(r.timeIn || '-')}</span></td>
+        <td>${this.isLeave(r) ? `<span class="status-pill badge-leave">On Leave${r.leaveType ? ' – ' + this.escape(r.leaveType) : ''}</span>` : `<span style="color: var(--primary); font-weight: 600;">${this.escape(r.timeIn || '-')}</span>`}</td>
         <td><span style="color: #0284c7; font-weight: 600;">${this.escape(r.timeOut || '-')}</span></td>
         <td><small style="color: var(--text-muted);">${this.escape(r.actualGpsIn || '-')}</small></td>
         <td><span class="status-pill badge-${(r.syncStatus || 'PENDING').toLowerCase()}">${r.syncStatus}</span></td>
@@ -1396,7 +2031,15 @@ class AttendanceApp {
           <div>Date: <strong>${this.escape(rec.attendanceDate)}</strong></div>
         </div>
 
-        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+        ${this.isLeave(rec) ? `
+          <div style="background: #fef3c7; padding: 10px; border-radius: 6px; border: 1px solid #fde68a;">
+            <div style="font-weight: 700; color: #b45309;">🏖 On Leave</div>
+            <div>Type: <strong>${this.escape(rec.leaveType || '-')}</strong></div>
+            <div>Remarks: ${this.escape(rec.leaveRemarks || '-')}</div>
+          </div>
+        ` : ''}
+
+        <div style="display: ${this.isLeave(rec) ? 'none' : 'grid'}; grid-template-columns: 1fr 1fr; gap: 12px;">
           <div style="background: #f0fdf4; padding: 10px; border-radius: 6px;">
             <div style="font-weight: 600; color: var(--primary);">TIME IN</div>
             <div style="font-size: 16px; font-weight: 700;">${this.escape(rec.timeIn || 'None')}</div>
@@ -1492,7 +2135,8 @@ class AttendanceApp {
       'Landowner ID', 'Landowner Name', 'Location ID', 'Work Location', 'Attendance Date',
       'Time IN', 'Time OUT', 'Original Time IN', 'Original Time OUT', 'Adjusted By',
       'Adjustment Reason', 'Actual GPS IN', 'Actual GPS OUT', 'Device Timestamp',
-      'Synchronization Date', 'Synchronization Status'
+      'Synchronization Date', 'Synchronization Status',
+      'Attendance Type', 'Leave Type', 'Leave Remarks'
     ];
 
     const rows = validRecords.map((r) => [
@@ -1516,7 +2160,10 @@ class AttendanceApp {
       `"${r.actualGpsOut || ''}"`,
       `"${r.deviceTimestamp || ''}"`,
       `"${r.synchronizationDate || ''}"`,
-      `"${r.syncStatus}"`
+      `"${r.syncStatus}"`,
+      `"${this.isLeave(r) ? 'LEAVE' : 'PRESENT'}"`,
+      `"${r.leaveType || ''}"`,
+      `"${(r.leaveRemarks || '').replace(/"/g, '""')}"`
     ]);
 
     const csvContent = '\uFEFF' + [headers.join(','), ...rows.map((row) => row.join(','))].join('\r\n');
@@ -1524,7 +2171,7 @@ class AttendanceApp {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `Attendance_Report_${new Date().toISOString().split('T')[0]}.csv`;
+    a.download = `Attendance_Report_${this.todayStr()}.csv`;
     a.click();
     URL.revokeObjectURL(url);
   }
@@ -1771,7 +2418,7 @@ class AttendanceApp {
 
               <div class="form-group">
                 <label class="form-label required">Date Enrolled</label>
-                <input type="date" id="emp-date-enrolled" class="form-control" value="${new Date().toISOString().split('T')[0]}" required />
+                <input type="date" id="emp-date-enrolled" class="form-control" value="${this.todayStr()}" required />
               </div>
             </div>
 
