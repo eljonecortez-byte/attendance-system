@@ -94,7 +94,7 @@ class AttendanceApp {
           <path d="M12 2a8 8 0 0 0-8 8c0 5.25 8 12 8 12s8-6.75 8-12a8 8 0 0 0-8-8z"/>
           <circle cx="12" cy="10" r="3"/>
         </svg>
-        <span>GPS: ${this.activeGps.coords} (±${this.activeGps.accuracy}m)</span>
+        <span class="gps-text">GPS<span class="gps-coords">: ${this.activeGps.coords}</span> (±${this.activeGps.accuracy}m)</span>
       `;
     } else {
       pill.className = 'gps-pill';
@@ -176,6 +176,13 @@ class AttendanceApp {
 
   // Bind Global UI Events
   bindEvents() {
+    // Keep table cells labelled for the mobile card layout
+    const viewRoot = document.getElementById('view-content-root');
+    if (viewRoot && !this._tableObserver) {
+      this._tableObserver = new MutationObserver(() => this.labelTableCells(viewRoot));
+      this._tableObserver.observe(viewRoot, { childList: true, subtree: true });
+    }
+
     // Mobile Sidebar toggle
     const toggleBtn = document.getElementById('sidebar-toggle');
     const sidebar = document.getElementById('sidebar');
@@ -425,8 +432,32 @@ class AttendanceApp {
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
           <span>Sync</span>
         </div>
+        ${isAdmin ? `
+        <div class="bottom-nav-item" onclick="event.stopPropagation(); app.toggleSidebar()">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+          <span>More</span>
+        </div>` : ''}
       `;
     }
+  }
+
+  toggleSidebar() {
+    const sidebar = document.getElementById('sidebar');
+    if (sidebar) sidebar.classList.toggle('open');
+  }
+
+  // Mobile: tag every table cell with its column name so CSS can show tables as stacked cards
+  labelTableCells(root) {
+    (root || document).querySelectorAll('table.data-table').forEach((table) => {
+      const headers = Array.from(table.querySelectorAll('thead th')).map((th) => th.textContent.trim());
+      table.querySelectorAll('tbody tr').forEach((tr) => {
+        Array.from(tr.children).forEach((td, i) => {
+          if (!td.hasAttribute('data-label') && !td.hasAttribute('colspan')) {
+            td.setAttribute('data-label', headers[i] || '');
+          }
+        });
+      });
+    });
   }
 
   navigateTo(viewName) {
@@ -456,7 +487,7 @@ class AttendanceApp {
         break;
 
       case 'attendance':
-        if (titleEl) titleEl.textContent = 'Record Attendance (Time IN / OUT)';
+        if (titleEl) titleEl.textContent = 'Record Attendance';
         this.renderAttendanceRecording(container);
         break;
 
@@ -520,7 +551,7 @@ class AttendanceApp {
     }
 
     root.innerHTML = `
-      <div style="width: 100%; max-width: 440px; padding: 32px; background: #ffffff; border-radius: 16px; box-shadow: var(--shadow-lg); border: 1px solid var(--border);">
+      <div class="login-card" style="width: 100%; max-width: 440px; padding: 32px; background: #ffffff; border-radius: 16px; box-shadow: var(--shadow-lg); border: 1px solid var(--border);">
         <div style="text-align: center; margin-bottom: 24px;">
           <img src="icons/icon.svg" style="width: 64px; height: 64px; border-radius: 12px; margin-bottom: 12px;" alt="Logo" />
           <h2 style="font-size: 20px; font-weight: 700; color: var(--primary);">Attendance System</h2>
@@ -658,7 +689,7 @@ class AttendanceApp {
 
     container.innerHTML = `
       ${!isAdmin ? `
-        <div class="content-card" style="background: linear-gradient(135deg, #15803d, #16a34a); color: #ffffff; padding: 16px 20px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-bottom: 20px;">
+        <div class="content-card banner-card" style="background: linear-gradient(135deg, #15803d, #16a34a); color: #ffffff; padding: 16px 20px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-bottom: 20px;">
           <div style="display: flex; align-items: center; gap: 14px;">
             <div style="width: 44px; height: 44px; border-radius: 50%; background: rgba(255,255,255,0.2); display: flex; align-items: center; justify-content: center; font-size: 22px;">🌾</div>
             <div>
@@ -726,7 +757,7 @@ class AttendanceApp {
       </div>
 
       <!-- Quick Action Banner -->
-      <div class="content-card" style="background: linear-gradient(135deg, #15803d, #16a34a); color: #ffffff; padding: 20px; display: flex; align-items: center; justify-content: space-between; flex-wrap: gap; margin-bottom: 24px;">
+      <div class="content-card banner-card" style="background: linear-gradient(135deg, #15803d, #16a34a); color: #ffffff; padding: 20px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-bottom: 24px;">
         <div>
           <h3 style="font-size: 18px; font-weight: 700; margin-bottom: 4px;">Ready to record attendance?</h3>
           <p style="font-size: 13px; opacity: 0.9;">Time IN and Time OUT work seamlessly offline and online.</p>
@@ -813,7 +844,7 @@ class AttendanceApp {
 
     container.innerHTML = `
       <!-- Active Area Checking Banner for Supervisor -->
-      <div class="content-card" style="background: linear-gradient(135deg, #15803d, #16a34a); color: #ffffff; padding: 16px 20px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-bottom: 20px;">
+      <div class="content-card banner-card" style="background: linear-gradient(135deg, #15803d, #16a34a); color: #ffffff; padding: 16px 20px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-bottom: 20px;">
         <div style="display: flex; align-items: center; gap: 14px;">
           <div style="width: 44px; height: 44px; border-radius: 50%; background: rgba(255,255,255,0.2); display: flex; align-items: center; justify-content: center; font-size: 22px;">🌾</div>
           <div>
