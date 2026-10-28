@@ -12,25 +12,42 @@ A complete, responsive, mobile-friendly **Employee Attendance Monitoring System*
    - **Supervisor**: Restricted access. Supervisors can **only view and manage employees assigned to them**, their designated landowners, and work locations.
    - **Employee**: Field personnel monitored by the system.
 
-2. **100% Offline Capability**:
+2. **Admin Dashboard (summary only)**:
+   - Admins do not record attendance. The dashboard shows a summary for any date: Total, Present, On Leave, Absent, Pending Upload.
+   - Pie (donut) chart of Present / On Leave / Absent, a per-supervisor table (Team, Present, Leave, Absent, Rate), a 7-day trend, and an "Absent - Needs Follow-up" list grouped by supervisor.
+   - Filters by Supervisor and Work Location, previous/next day, **Export CSV** day report.
+   - *Absent* is calculated automatically: an active employee with no Time IN and no leave for that date.
+
+3. **Landowners follow the Work Location**:
+   - Admin registers a Landowner under a Work Location (Landowners page). The supervisor is taken automatically from that location (Work Locations page).
+   - A supervisor only sees landowners registered under the location(s) assigned to him/her. Example: Farm 4 Block 1 is assigned to Francis, so Francis only sees the landowners of Farm 4 Block 1.
+   - This applies to the Area Checking popup, the Adjust form, the History filter and the data downloaded to the phone (`Code.gs`). Supervisors cannot type a custom landowner, and the login screen no longer lists landowners.
+   - If a location has no supervisor, or a landowner has no location, nobody sees that landowner until the admin fixes it.
+
+4. **On Leave** (Supervisor):
+   - On **Record Attendance**, tap **Mark On Leave** on an employee: choose Leave Type (Sick, Vacation, Emergency, Personal, Other), From date, optional To date (one record is created per day, up to 31 days) and remarks.
+   - An employee on leave cannot Time IN that day until the leave is cancelled (**Cancel Leave** keeps an audit trail).
+   - Leave syncs offline/online like any other record and appears in History (filter by type), the dashboards and CSV exports.
+
+5. **100% Offline Capability**:
    - Built with **IndexedDB** for storing thousands of offline attendance records safely on the device.
    - **Service Worker (`sw.js`)** pre-caches application assets for instant offline load.
    - **Offline Authentication**: Supervisors and Admins who have logged in once can log in offline using cryptographically hashed credentials (SHA-256 via Web Crypto API).
    - Generates a local unique **Attendance Record ID** for every punch.
 
-3. **Smart Synchronization & Duplicate Prevention**:
+6. **Smart Synchronization & Duplicate Prevention**:
    - **Automatic Sync**: Detects internet restoration (`online` event & Service Worker message) and syncs pending records automatically.
    - **Manual Sync**: Sync All Pending, Retry Failed, or Sync Selected records.
    - **Idempotent Upsert**: Backend validates `Attendance Record ID` before inserting. If a record already exists, it updates the record (e.g. adding Time OUT or manual adjustment) instead of creating duplicate rows.
    - **History Retention**: Local records are **never deleted** after synchronization; their status simply changes to `SYNCED`.
 
-4. **Accurate Attendance Recording (Time IN & Time OUT)**:
+7. **Accurate Attendance Recording (Time IN & Time OUT)**:
    - High-accuracy GPS coordinate capture (Latitude, Longitude, Accuracy in meters) via `navigator.geolocation`.
    - **Separation of Locations**: Assigned Work Location and Actual GPS Location are tracked separately to verify field presence.
    - Device timestamping and supervisor signature.
    - **Manual Adjustments with Audit Trail**: Editable date and time with mandatory reason, recording both original and adjusted timestamps.
 
-5. **Data Protection & Soft Deletion**:
+8. **Data Protection & Soft Deletion**:
    - Records are never permanently deleted by accident. Authorized deletions mark `recordStatus = 'DELETED'` and log the action, timestamp, and user reason into the **Audit Logs**.
    - One-click **Export to CSV / Excel** with UTF-8 BOM encoding.
 
@@ -57,7 +74,12 @@ Attendance System/
 │   └── app.js            # UI routing, GPS capture, Attendance recording, CSV Export
 │
 └── icons/
-    └── icon.svg          # Crisp Vector PWA icon & favicon
+    ├── logo-full.png         # CocoTrack logo with text (login screen)
+    ├── logo-emblem.png       # Round emblem (sidebar)
+    ├── favicon-64.png        # Browser tab icon
+    ├── apple-touch-icon.png  # iPhone home-screen icon
+    ├── app-icon-192/512.png, app-icon-maskable-192/512.png   # Android / PWA home-screen icons (emblem + COCOTRACK)
+    └── apple-touch-icon-v2.png  # iPhone home-screen icon
 ```
 
 ---
@@ -76,7 +98,7 @@ When Google Apps Script runs, it automatically creates and formats the following
 4. **`Work Locations`**:
    `[Location ID, Work Location Name, Description, Landowner ID, Landowner Name, Supervisor ID, Status]`
 5. **`Attendance`**:
-   `[Attendance Record ID, Employee ID, Employee Name, Supervisor ID, Supervisor Name, Landowner ID, Landowner Name, Location ID, Work Location, Attendance Date, Time IN, Time OUT, Original Time IN, Original Time OUT, Adjusted By, Adjustment Reason, Actual GPS IN, Actual GPS OUT, Device Timestamp, Synchronization Date, Synchronization Status, Record Status]`
+   `[Attendance Record ID, Employee ID, Employee Name, Supervisor ID, Supervisor Name, Landowner ID, Landowner Name, Location ID, Work Location, Attendance Date, Time IN, Time OUT, Original Time IN, Original Time OUT, Adjusted By, Adjustment Reason, Actual GPS IN, Actual GPS OUT, Device Timestamp, Synchronization Date, Synchronization Status, Record Status, Attendance Type, Leave Type, Leave Remarks]`
 6. **`Audit Logs`**:
    `[Log ID, User ID, User Role, Action, Record ID, Previous Value, New Value, Reason, Date and Time]`
 7. **`Users`**:
@@ -103,6 +125,8 @@ When Google Apps Script runs, it automatically creates and formats the following
    - Click **Deploy**.
    - If prompted, click **Authorize access**, choose your Google account, click **Advanced**, and click **Go to Untitled project (unsafe)** to grant spreadsheet access.
    - Copy the generated **Web App URL** (it ends with `/exec`).
+
+> **Updating an existing deployment?** Paste the new `Code.gs`, click **Deploy > Manage deployments > (pencil) Edit > Version: New version > Deploy**. The Web App URL stays the same. The three new Attendance columns are added to your existing sheet automatically on the next request, and existing data is kept. Also check **Project Settings > Time zone = (GMT+08:00) Manila**.
 
 ### Step 2: Connect the Frontend Application to Google Sheets
 
