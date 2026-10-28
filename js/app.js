@@ -47,6 +47,65 @@ class AttendanceApp {
     return `"${String(v === null || v === undefined ? '' : v).replace(/"/g, '""')}"`;
   }
 
+  /* ---------- LANDOWNER RULE ----------
+     A supervisor can only use landowners that are registered under the Work Location(s)
+     assigned to that supervisor. Example: Farm 4 Block 1 is assigned to Francis, so Francis
+     only sees the landowners of Farm 4 Block 1.
+     A landowner matches when its Location ID is one of the supervisor's locations,
+     or when one of the supervisor's locations lists that landowner. */
+  filterLandownersForSupervisor(landowners, locations, supervisorId) {
+    const sid = String(supervisorId || '');
+    if (!sid) return [];
+    const myLocs = (locations || []).filter(
+      (loc) => String(loc.supervisorId || '') === sid && (loc.status || 'Active') === 'Active'
+    );
+    const locById = new Map(myLocs.map((loc) => [String(loc.locationId), loc]));
+    const locByLandowner = new Map();
+    myLocs.forEach((loc) => { if (loc.landownerId) locByLandowner.set(String(loc.landownerId), loc); });
+
+    const result = [];
+    (landowners || []).forEach((l) => {
+      if ((l.status || 'Active') !== 'Active') return;
+      const loc = locById.get(String(l.locationId || '')) || locByLandowner.get(String(l.landownerId));
+      if (!loc) return;
+      result.push(Object.assign({}, l, {
+        locationId: loc.locationId,
+        workLocation: loc.workLocationName || l.workLocation || ''
+      }));
+    });
+    return result.sort((a, b) =>
+      String(a.workLocation).localeCompare(String(b.workLocation)) ||
+      String(a.landownerName).localeCompare(String(b.landownerName))
+    );
+  }
+
+  // Landowners the current user may pick (supervisor: only their locations; admin: all active)
+  async getAllowedLandowners() {
+    const [landowners, locations] = await Promise.all([db.getAll('landowners'), db.getAll('locations')]);
+    if (auth.isSupervisor()) {
+      return this.filterLandownersForSupervisor(landowners, locations, auth.getLinkedSupervisorId());
+    }
+    return landowners.filter((l) => (l.status || 'Active') === 'Active');
+  }
+
+  // Drop a remembered area-checking landowner that this supervisor is no longer allowed to use
+  // (different account on the same phone, or the location was reassigned by the admin).
+  async validateSessionLandowner() {
+    if (!this.sessionLandowner) return;
+    if (!auth.isSupervisor()) return;
+    const locations = await db.getAll('locations');
+    if (locations.length === 0) return; // data not downloaded yet: do not clear anything
+    const allowed = await this.getAllowedLandowners();
+    const cur = this.sessionLandowner;
+    const ok = allowed.some((l) => String(l.landownerId) === String(cur.id) || l.landownerName === cur.name);
+    if (!ok) {
+      this.sessionLandowner = null;
+      await db.setSetting('sessionLandowner', null);
+      const pillText = document.getElementById('session-landowner-name-display');
+      if (pillText) pillText.textContent = 'Area: Select Landowner';
+    }
+  }
+
   async init() {
     console.log('[App] Initializing application...');
 
@@ -74,11 +133,13 @@ class AttendanceApp {
 
     // Route to appropriate view
     if (user) {
+      await this.validateSessionLandowner();
       this.renderAppShell();
       this.navigateTo('dashboard');
       // If online, sync pending or pull latest data in background
       if (navigator.onLine) {
         syncService.autoSync();
+        syncService.pullRemoteData(); // keeps assigned locations / landowners up to date
       }
     } else {
       this.showLoginView();
@@ -173,7 +234,7 @@ class AttendanceApp {
       this.refreshCurrentView();
     } else if (event.type === 'DATA_PULLED') {
       this.lastDataPull = new Date();
-      this.refreshCurrentView();
+      this.validateSessionLandowner().then(() => this.refreshCurrentView());
     }
   }
 
@@ -314,9 +375,14 @@ class AttendanceApp {
     const locInput = document.getElementById('modal-landowner-location');
     if (!modal || !select) return;
 
-    // Load enrolled landowners
-    const landowners = await db.getAll('landowners');
-    select.innerHTML = '<option value="">-- Choose from Enrolled Landowners --</option>';
+    // Only landowners registered under this supervisor's assigned location(s)
+    const landowners = await this.getAllowedLandowners();
+    const emptyNote = document.getElementById('modal-landowner-empty');
+    if (emptyNote) emptyNote.style.display = landowners.length === 0 ? 'block' : 'none';
+    if (locInput) locInput.readOnly = true;
+    select.innerHTML = landowners.length === 0
+      ? '<option value="">-- No landowner registered for your location --</option>'
+      : '<option value="">-- Choose Landowner --</option>';
     landowners.forEach((l) => {
       const opt = document.createElement('option');
       opt.value = l.landownerName;
@@ -329,7 +395,7 @@ class AttendanceApp {
       select.appendChild(opt);
     });
 
-    if (customInput) customInput.value = (this.sessionLandowner && !landowners.some((l) => l.landownerName === this.sessionLandowner.name)) ? this.sessionLandowner.name : '';
+    if (customInput) customInput.value = '';
     if (locInput) locInput.value = this.sessionLandowner ? (this.sessionLandowner.workLocation || '') : '';
 
     this.openModal('landowner-session-modal');
@@ -589,19 +655,11 @@ class AttendanceApp {
     const root = document.getElementById('login-view-wrapper');
     if (!root) return;
 
-    let cachedLandowners = [];
-    try {
-      cachedLandowners = (await db.getAll('landowners')) || [];
-    } catch (e) {
-      cachedLandowners = [];
-    }
-
     root.innerHTML = `
       <div class="login-card" style="width: 100%; max-width: 440px; padding: 32px; background: #ffffff; border-radius: 16px; box-shadow: var(--shadow-lg); border: 1px solid var(--border);">
         <div style="text-align: center; margin-bottom: 24px;">
-          <img src="icons/icon.svg" style="width: 64px; height: 64px; border-radius: 12px; margin-bottom: 12px;" alt="Logo" />
-          <h2 style="font-size: 20px; font-weight: 700; color: var(--primary);">Attendance System</h2>
-          <p style="font-size: 13px; color: var(--text-muted); margin-top: 4px;">Online & Offline Mobile Attendance Monitoring</p>
+          <img src="icons/logo-full.png" class="login-logo" alt="CocoTrack Attendance & Monitoring" />
+          <p style="font-size: 13px; color: var(--text-muted); margin-top: 10px;">Online & Offline Mobile Attendance Monitoring</p>
         </div>
 
         <form id="login-form">
@@ -613,15 +671,6 @@ class AttendanceApp {
           <div class="form-group">
             <label class="form-label required">Password</label>
             <input type="password" id="login-password" class="form-control" placeholder="••••••••" required autocomplete="current-password" />
-          </div>
-
-          <div class="form-group" id="login-landowner-wrapper">
-            <label class="form-label">🌾 Landowner for Area Checking <small style="color: var(--text-muted); font-weight: normal;">(For Supervisors)</small></label>
-            <select id="login-landowner-select" class="form-control">
-              <option value="">-- Select Landowner for Today's Area Checking --</option>
-              ${cachedLandowners.map((l) => `<option value="${this.escape(l.landownerName)}" data-id="${l.landownerId}" data-loc="${this.escape(l.workLocation || '')}">${this.escape(l.landownerName)}</option>`).join('')}
-            </select>
-            <div class="form-helper">Daily workers' Time IN punches will record this Landowner name.</div>
           </div>
 
           <div id="login-error-alert" style="display: none; padding: 10px 14px; background: #fee2e2; color: #b91c1c; border-radius: 8px; font-size: 13px; margin-bottom: 16px;"></div>
@@ -650,7 +699,6 @@ class AttendanceApp {
       e.preventDefault();
       const username = document.getElementById('login-username').value;
       const password = document.getElementById('login-password').value;
-      const lndSelect = document.getElementById('login-landowner-select');
       const errEl = document.getElementById('login-error-alert');
       const submitBtn = document.getElementById('login-submit-btn');
 
@@ -661,17 +709,13 @@ class AttendanceApp {
       try {
         const res = await auth.login(username, password);
 
-        // If supervisor selected a landowner at login, store it as active session landowner
-        if (lndSelect && lndSelect.value) {
-          const opt = lndSelect.options[lndSelect.selectedIndex];
-          const lndObj = {
-            id: opt.getAttribute('data-id') || '',
-            name: lndSelect.value,
-            workLocation: opt.getAttribute('data-loc') || ''
-          };
-          this.sessionLandowner = lndObj;
-          await db.setSetting('sessionLandowner', lndObj);
+        // Download this account's latest locations / landowners, then drop any area that is not theirs
+        const apiUrl = await db.getSetting('apiUrl', '');
+        if (navigator.onLine && apiUrl && res.mode === 'online') {
+          submitBtn.textContent = 'Loading your areas...';
+          await syncService.pullRemoteData();
         }
+        await this.validateSessionLandowner();
 
         this.showToast(res.message, res.mode === 'offline' ? 'warning' : 'success');
         this.renderAppShell();
@@ -721,7 +765,7 @@ class AttendanceApp {
     if (!isAdmin && supervisorId) {
       employees = allEmployees.filter((e) => (e.supervisorId || '').toString() === supervisorId.toString());
       attendance = attendance.filter((a) => (a.supervisorId || '').toString() === supervisorId.toString());
-      landowners = allLandowners.filter((l) => (l.supervisorId || '').toString() === supervisorId.toString());
+      landowners = this.filterLandownersForSupervisor(allLandowners, allLocations, supervisorId);
       locations = allLocations.filter((loc) => (loc.supervisorId || '').toString() === supervisorId.toString());
     }
 
@@ -1437,7 +1481,7 @@ class AttendanceApp {
 
     if (!isAdmin && supervisorId) {
       employees = employees.filter((e) => (e.supervisorId || '').toString() === supervisorId.toString());
-      myLandowners = landowners.filter((l) => (l.supervisorId || '').toString() === supervisorId.toString());
+      myLandowners = this.filterLandownersForSupervisor(landowners, locations, supervisorId);
       myLocations = locations.filter((loc) => (loc.supervisorId || '').toString() === supervisorId.toString());
     }
 
@@ -1729,6 +1773,11 @@ class AttendanceApp {
     }
 
     const todayDate = this.todayStr();
+    const allowedLnd = await this.getAllowedLandowners();
+    const curLnd = record ? (record.landownerName || '') : (this.sessionLandowner ? this.sessionLandowner.name : '');
+    const lndNames = allowedLnd.map((l) => l.landownerName);
+    if (curLnd && !lndNames.includes(curLnd)) lndNames.unshift(curLnd); // keep what the record already has
+    const lndOptions = `<option value="">-- None --</option>` + lndNames.map((n) => `<option value="${this.escape(n)}" ${n === curLnd ? 'selected' : ''}>${this.escape(n)}</option>`).join('');
     const nowTimeStr = new Date().toTimeString().substring(0, 5); // HH:MM for time input
 
     const modal = document.getElementById('adjustment-modal');
@@ -1764,7 +1813,7 @@ class AttendanceApp {
 
         <div class="form-group">
           <label class="form-label">🌾 Area Checking Landowner</label>
-          <input type="text" id="adj-landowner" class="form-control" placeholder="e.g. Don Ramon Agricultural Estate" value="${record ? (record.landownerName || '') : (this.sessionLandowner ? this.sessionLandowner.name : '')}" />
+          <select id="adj-landowner" class="form-control">${lndOptions}</select>
           <div class="form-helper">Landowner where area checking was conducted.</div>
         </div>
 
@@ -1879,6 +1928,16 @@ class AttendanceApp {
     // Sort newest date first
     records.sort((a, b) => (b.attendanceDate > a.attendanceDate ? 1 : -1));
 
+    // Landowner filter list: admin sees all; a supervisor only sees landowners of their own location(s)
+    // (plus any landowner already stamped on their own past records)
+    const historyLandownerNames = new Set();
+    if (isAdmin) {
+      landowners.forEach((l) => historyLandownerNames.add(l.landownerName));
+    } else {
+      this.filterLandownersForSupervisor(landowners, locations, supervisorId).forEach((l) => historyLandownerNames.add(l.landownerName));
+      records.forEach((r) => { if (r.landownerName) historyLandownerNames.add(r.landownerName); });
+    }
+
     container.innerHTML = `
       <!-- History Toolbar -->
       <div class="toolbar">
@@ -1891,7 +1950,7 @@ class AttendanceApp {
 
         <select id="hist-landowner-filter" class="select-filter" onchange="app.filterHistoryTable()">
           <option value="">All Landowners</option>
-          ${landowners.map((l) => `<option value="${this.escape(l.landownerName)}">${this.escape(l.landownerName)}</option>`).join('')}
+          ${[...historyLandownerNames].sort().map((n) => `<option value="${this.escape(n)}">${this.escape(n)}</option>`).join('')}
         </select>
 
         <select id="hist-location-filter" class="select-filter" onchange="app.filterHistoryTable()">
@@ -2757,9 +2816,9 @@ class AttendanceApp {
 
             <div class="form-row">
               <div class="form-group">
-                <label class="form-label required">Assigned Supervisor</label>
-                <select id="lnd-sup-select" class="form-control" required>
-                  <option value="">Select Supervisor</option>
+                <label class="form-label">Supervisor <small style="font-weight: normal; color: var(--text-muted);">(automatic, from the Work Location)</small></label>
+                <select id="lnd-sup-select" class="form-control" disabled>
+                  <option value="">Select a Work Location first</option>
                   ${supervisors.map((s) => `<option value="${s.supervisorId}">${this.escape(s.supervisorName)}</option>`).join('')}
                 </select>
               </div>
@@ -2791,7 +2850,7 @@ class AttendanceApp {
                   <th>Landowner ID</th>
                   <th>Full Name</th>
                   <th>Assigned Location</th>
-                  <th>Assigned Supervisor ID</th>
+                  <th>Supervisor (via location)</th>
                   <th>Status</th>
                 </tr>
               </thead>
@@ -2800,8 +2859,13 @@ class AttendanceApp {
                   <tr>
                     <td><span class="emp-id-badge">${this.escape(l.landownerId)}</span></td>
                     <td><strong>${this.escape(l.landownerName)}</strong></td>
-                    <td>${this.escape(l.workLocation || '-')}</td>
-                    <td>${this.escape(l.supervisorId || '-')}</td>
+                    ${(() => {
+                      const loc = locations.find((x) => String(x.locationId) === String(l.locationId)) ||
+                                  locations.find((x) => x.landownerId && String(x.landownerId) === String(l.landownerId));
+                      const sup = loc ? supervisors.find((x) => String(x.supervisorId) === String(loc.supervisorId)) : null;
+                      return `<td>${this.escape((loc && loc.workLocationName) || l.workLocation || '-')}</td>
+                    <td>${sup ? this.escape(sup.supervisorName) : '<span class="status-pill badge-leave">No supervisor yet</span>'}</td>`;
+                    })()}
                     <td><span class="status-pill ${l.status === 'Active' ? 'status-online' : 'status-offline'}">${l.status}</span></td>
                   </tr>
                 `).join('')}
@@ -2812,6 +2876,14 @@ class AttendanceApp {
       </div>
     `;
 
+    // Show which supervisor the chosen Work Location belongs to
+    document.getElementById('lnd-loc-select').addEventListener('change', (ev) => {
+      const loc = locations.find((x) => String(x.locationId) === String(ev.target.value));
+      const supSel = document.getElementById('lnd-sup-select');
+      supSel.value = loc && loc.supervisorId ? loc.supervisorId : '';
+      if (loc && !loc.supervisorId) this.showToast('This location has no supervisor yet. Assign one under Work Locations so the supervisor can see this landowner.', 'warning');
+    });
+
     document.getElementById('enroll-lnd-form').addEventListener('submit', async (e) => {
       e.preventDefault();
       const lndId = document.getElementById('lnd-id-input').value.trim();
@@ -2819,7 +2891,8 @@ class AttendanceApp {
       const locSelect = document.getElementById('lnd-loc-select');
       const locationId = locSelect.value;
       const workLocation = locSelect.options[locSelect.selectedIndex]?.getAttribute('data-name') || '';
-      const supervisorId = document.getElementById('lnd-sup-select').value;
+      const chosenLoc = locations.find((x) => String(x.locationId) === String(locationId)) || {};
+      const supervisorId = chosenLoc.supervisorId || '';
       const status = document.getElementById('lnd-status-select').value;
 
       const landownerObj = {
