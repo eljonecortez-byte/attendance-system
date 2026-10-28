@@ -291,6 +291,13 @@ class SyncService {
       if (result && result.success && result.data) {
         const { employees, supervisors, landowners, locations, attendance, users } = result.data;
 
+        // A supervisor's phone must mirror exactly what the server says is theirs:
+        // remove landowners / locations that were reassigned or removed since the last download.
+        if (role === 'Supervisor') {
+          if (landowners) await db.clear('landowners');
+          if (locations) await db.clear('locations');
+        }
+
         // Batch save into IndexedDB
         if (employees) await db.batchPut('employees', employees);
         if (supervisors) await db.batchPut('supervisors', supervisors);
