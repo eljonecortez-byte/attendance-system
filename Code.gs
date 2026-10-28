@@ -310,17 +310,24 @@ function handleGetInitialData(payload) {
       return (e.supervisorId || '').toString() === supervisorId;
     });
 
-    filteredLandowners = allLandowners.filter(function(l) {
-      return !l.supervisorId || (l.supervisorId || '').toString() === supervisorId;
-    });
-    if (filteredLandowners.length === 0) {
-      filteredLandowners = allLandowners.filter(function(l) {
-        return l.status === 'Active';
-      });
-    }
-
     filteredLocations = allLocations.filter(function(loc) {
       return (loc.supervisorId || '').toString() === supervisorId;
+    });
+
+    // LANDOWNER RULE: a supervisor only receives landowners registered under the
+    // Work Location(s) assigned to that supervisor (matched by Location ID, or by the
+    // Landowner ID listed on the supervisor's location).
+    var myLocIds = {};
+    var myLocLandownerIds = {};
+    filteredLocations.forEach(function(loc) {
+      if ((loc.status || 'Active') === 'Active') {
+        myLocIds[(loc.locationId || '').toString()] = true;
+        if (loc.landownerId) myLocLandownerIds[loc.landownerId.toString()] = true;
+      }
+    });
+    filteredLandowners = allLandowners.filter(function(l) {
+      if ((l.status || 'Active') !== 'Active') return false;
+      return !!myLocIds[(l.locationId || '').toString()] || !!myLocLandownerIds[(l.landownerId || '').toString()];
     });
 
     filteredAttendance = allAttendance.filter(function(a) {
