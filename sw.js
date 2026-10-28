@@ -1,5 +1,5 @@
 // Service Worker for Employee Attendance Monitoring System
-const CACHE_NAME = 'attendance-app-v1.2.0';
+const CACHE_NAME = 'attendance-app-v1.4.0';
 
 const ASSETS_TO_CACHE = [
   './',
@@ -10,7 +10,10 @@ const ASSETS_TO_CACHE = [
   './js/sync.js',
   './js/app.js',
   './manifest.json',
-  './icons/icon.svg'
+  './icons/logo-full.png',
+  './icons/logo-emblem.png',
+  './icons/favicon-64.png',
+  './icons/icon-192.png'
 ];
 
 // Install Event - Pre-cache core assets
