@@ -88,9 +88,17 @@ body {
 }
 
 .sidebar-logo {
-  width: 36px;
-  height: 36px;
-  border-radius: var(--radius-sm);
+  width: 40px;
+  height: 40px;
+  object-fit: contain;
+}
+
+.login-logo {
+  display: block;
+  width: 100%;
+  max-width: 230px;
+  height: auto;
+  margin: 0 auto;
 }
 
 .sidebar-title h1 {
