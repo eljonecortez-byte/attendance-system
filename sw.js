@@ -1,5 +1,9 @@
 // Service Worker for Employee Attendance Monitoring System
-   const CACHE_NAME = 'attendance-app-v1.5.0';
+// Strategy: NETWORK FIRST for the app's own files.
+//   - Online: always loads the latest version from GitHub, then saves a copy.
+//   - Offline: falls back to the saved copy.
+// You no longer need to change the version number for updates to show up.
+const CACHE_NAME = 'attendance-app-v2.0.0';
 
 const ASSETS_TO_CACHE = [
   './',
@@ -13,93 +17,104 @@ const ASSETS_TO_CACHE = [
   './icons/logo-full.png',
   './icons/logo-emblem.png',
   './icons/favicon-64.png',
-  './icons/icon-192.png'
+  './icons/app-icon-192.png',
+  './icons/apple-touch-icon-v2.png'
 ];
 
-// Install Event - Pre-cache core assets
+// Install: save core files one by one, so a single missing file
+// (e.g. an icon) doesn't stop the whole update from installing.
 self.addEventListener('install', (event) => {
   event.waitUntil(
-    caches.open(CACHE_NAME).then((cache) => {
-      console.log('[SW] Pre-caching offline assets');
-      return cache.addAll(ASSETS_TO_CACHE);
-    }).then(() => self.skipWaiting())
+    caches.open(CACHE_NAME).then((cache) =>
+      Promise.all(
+        ASSETS_TO_CACHE.map((url) =>
+          cache.add(new Request(url, { cache: 'reload' })).catch((err) => {
+            console.warn('[SW] Could not cache', url, err);
+          })
+        )
+      )
+    ).then(() => self.skipWaiting())
   );
 });
 
-// Activate Event - Clean up obsolete caches
+// Activate: delete old caches and take control right away
 self.addEventListener('activate', (event) => {
   event.waitUntil(
-    caches.keys().then((cacheNames) => {
-      return Promise.all(
-        cacheNames.map((cache) => {
-          if (cache !== CACHE_NAME) {
-            console.log('[SW] Removing old cache:', cache);
-            return caches.delete(cache);
-          }
-        })
-      );
-    }).then(() => self.clients.claim())
+    caches.keys().then((cacheNames) =>
+      Promise.all(
+        cacheNames
+          .filter((name) => name !== CACHE_NAME)
+          .map((name) => {
+            console.log('[SW] Removing old cache:', name);
+            return caches.delete(name);
+          })
+      )
+    ).then(() => self.clients.claim())
   );
 });
 
-// Fetch Event - Cache-first strategy for local assets, Network-first for Google Apps Script API
-self.addEventListener('fetch', (event) => {
-  const requestUrl = new URL(event.request.url);
+// Some browsers (Safari) refuse redirected responses for page loads,
+// so copy them into a clean response.
+function cleanResponse(response) {
+  if (!response.redirected) return Promise.resolve(response);
+  return response.blob().then((body) =>
+    new Response(body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers
+    })
+  );
+}
 
-  // If request is to Google Apps Script or external API, use network directly
+self.addEventListener('fetch', (event) => {
+  const request = event.request;
+  if (request.method !== 'GET') return;
+
+  const requestUrl = new URL(request.url);
+
+  // Google Apps Script / Google APIs: network only, with offline JSON fallback
   if (requestUrl.hostname.includes('script.google.com') || requestUrl.hostname.includes('googleapis.com')) {
     event.respondWith(
-      fetch(event.request).catch((err) => {
-        // Return a JSON offline error fallback
-        return new Response(JSON.stringify({
+      fetch(request).catch(() =>
+        new Response(JSON.stringify({
           success: false,
           offline: true,
           error: 'Offline: Network request to Google Apps Script failed. Stored locally.'
         }), {
           status: 503,
           headers: { 'Content-Type': 'application/json' }
-        });
-      })
+        })
+      )
     );
     return;
   }
 
-  // Local assets: Stale-While-Revalidate / Cache First
+  // Other outside sites: leave alone
+  if (requestUrl.origin !== self.location.origin) return;
+
+  // App files: NETWORK FIRST, fall back to saved copy when offline
   event.respondWith(
-    caches.match(event.request).then((cachedResponse) => {
-      if (cachedResponse) {
-        // Optionally fetch updated version in background
-        fetch(event.request).then((networkResponse) => {
-          if (networkResponse && networkResponse.status === 200) {
-            caches.open(CACHE_NAME).then((cache) => cache.put(event.request, networkResponse));
+    fetch(request.url, { cache: 'no-cache' })
+      .then((networkResponse) => {
+        if (networkResponse && networkResponse.ok) {
+          const copy = networkResponse.clone();
+          caches.open(CACHE_NAME).then((cache) => cache.put(request, copy));
+        }
+        return cleanResponse(networkResponse);
+      })
+      .catch(() =>
+        caches.match(request, { ignoreSearch: true }).then((cached) => {
+          if (cached) return cached;
+          if (request.mode === 'navigate') {
+            return caches.match('./index.html');
           }
-        }).catch(() => { /* ignore background fetch errors when offline */ });
-
-        return cachedResponse;
-      }
-
-      return fetch(event.request).then((networkResponse) => {
-        if (!networkResponse || networkResponse.status !== 200 || networkResponse.type !== 'basic') {
-          return networkResponse;
-        }
-
-        const responseToCache = networkResponse.clone();
-        caches.open(CACHE_NAME).then((cache) => {
-          cache.put(event.request, responseToCache);
-        });
-
-        return networkResponse;
-      }).catch(() => {
-        // Fallback for HTML navigation requests
-        if (event.request.mode === 'navigate') {
-          return caches.match('./index.html');
-        }
-      });
-    })
+          return new Response('', { status: 504, statusText: 'Offline' });
+        })
+      )
   );
 });
 
-// Background Sync event (when connection resumes and browser supports Background Sync)
+// Background Sync (when connection resumes and browser supports it)
 self.addEventListener('sync', (event) => {
   if (event.tag === 'sync-attendance') {
     event.waitUntil(
