@@ -1,5 +1,5 @@
 // Service Worker for Employee Attendance Monitoring System
-const CACHE_NAME = 'attendance-app-v1.4.0';
+   const CACHE_NAME = 'attendance-app-v1.5.0';
 
 const ASSETS_TO_CACHE = [
   './',
