@@ -47,6 +47,127 @@ class AttendanceApp {
     return `"${String(v === null || v === undefined ? '' : v).replace(/"/g, '""')}"`;
   }
 
+  /* ---------- v3 helpers ---------- */
+
+  // Always "hh:mm AM" regardless of the phone's language settings
+  fmtTime(d) {
+    const p = (n) => String(n).padStart(2, '0');
+    let h = d.getHours();
+    const ampm = h >= 12 ? 'PM' : 'AM';
+    h = h % 12 || 12;
+    return `${p(h)}:${p(d.getMinutes())} ${ampm}`;
+  }
+
+  // Accepts "7:30 am", "07:30AM", "19:30" -> "07:30 AM" / "07:30 PM". Returns null if invalid.
+  normalizeTime(str) {
+    const m = String(str || '').trim().match(/^(\d{1,2}):(\d{2})\s*([AaPp][Mm])?$/);
+    if (!m) return null;
+    let h = Number(m[1]);
+    const min = Number(m[2]);
+    if (min > 59) return null;
+    let ampm = m[3] ? m[3].toUpperCase() : null;
+    if (ampm) {
+      if (h < 1 || h > 12) return null;
+    } else {
+      if (h > 23) return null;
+      ampm = h >= 12 ? 'PM' : 'AM';
+      h = h % 12 || 12;
+    }
+    return `${String(h).padStart(2, '0')}:${String(min).padStart(2, '0')} ${ampm}`;
+  }
+
+  timeToMinutes(t) {
+    const n = this.normalizeTime(t);
+    if (!n) return null;
+    let [hm, ampm] = n.split(' ');
+    let [h, m] = hm.split(':').map(Number);
+    if (h === 12) h = ampm === 'PM' ? 12 : 0; else if (ampm === 'PM') h += 12;
+    return h * 60 + m;
+  }
+
+  // Same rule as the server: break deducted on long days, overtime above regular hours
+  computeHours(timeIn, timeOut, settings) {
+    const a = this.timeToMinutes(timeIn), b = this.timeToMinutes(timeOut);
+    if (a === null || b === null) return { hours: '', overtime: '' };
+    let diff = b - a;
+    if (diff < 0) diff += 1440;
+    if (diff >= Number(settings.breakAfterHours) * 60) diff -= Number(settings.breakMinutes) || 0;
+    diff = Math.max(0, diff);
+    const hours = Math.round((diff / 60) * 100) / 100;
+    return { hours, overtime: Math.max(0, Math.round((hours - Number(settings.regularHours)) * 100) / 100) };
+  }
+
+  newRecordId(prefix = 'REC') {
+    const rnd = (crypto.getRandomValues ? Array.from(crypto.getRandomValues(new Uint8Array(4))).map((b) => b.toString(36)).join('') : Math.random().toString(36).slice(2, 8));
+    return `${prefix}-${Date.now()}-${rnd.toUpperCase().slice(0, 6)}`;
+  }
+
+  // Detects a wrong phone clock (compared with the server clock at the last sync)
+  async getClockFlags(now) {
+    const flags = [];
+    const settings = await auth.getAppSettings();
+    const offset = await db.getSetting('clockOffsetMs', null);
+    if (offset !== null && Math.abs(offset) > Number(settings.maxClockDriftMinutes || 5) * 60000) {
+      flags.push(`CLOCK_OFF_${Math.round(offset / 60000)}MIN`);
+    }
+    const lastTs = await db.getSetting('lastPunchTs', 0);
+    if (lastTs && now.getTime() + 60000 < lastTs) flags.push('CLOCK_WENT_BACK');
+    await db.setSetting('lastPunchTs', Math.max(now.getTime(), lastTs || 0));
+    return flags.join(',');
+  }
+
+  geofenceLabel(status, distance, radius) {
+    switch (status) {
+      case 'INSIDE': return `Inside area (${distance} m from center, limit ${radius} m)`;
+      case 'OUTSIDE': return `OUTSIDE area: ${distance} m from center (limit ${radius} m)`;
+      case 'NO_GPS': return 'No GPS signal';
+      case 'NO_LOCATION_COORDS': return 'Work location has no map coordinates yet';
+      default: return '';
+    }
+  }
+
+  // Small colored pills for geofence / clock / photo problems
+  renderFlags(r) {
+    const out = [];
+    const geoPill = (label, st) => {
+      if (!st) return;
+      if (st.startsWith('INSIDE')) out.push(`<span class="flag-pill ${st.includes('LOW') ? 'flag-warn' : 'flag-ok'}" title="${this.escape(st)}">${label} ✓${st.includes('LOW') ? ' (weak GPS)' : ''}</span>`);
+      else if (st.startsWith('OUTSIDE')) out.push(`<span class="flag-pill flag-bad" title="${this.escape(st)}">${label} outside</span>`);
+      else if (st === 'NO_GPS') out.push(`<span class="flag-pill flag-warn">${label} no GPS</span>`);
+    };
+    geoPill('IN', r.geofenceIn);
+    geoPill('OUT', r.geofenceOut);
+    if (r.clockFlag) out.push(`<span class="flag-pill flag-bad" title="${this.escape(r.clockFlag)}">Clock?</span>`);
+    if (!this.isLeave(r) && r.timeIn && !r.photoIn && r.photoInSkipped) out.push('<span class="flag-pill flag-warn">No IN photo</span>');
+    if (r.adjustedBy) out.push('<span class="flag-pill flag-warn">Adjusted</span>');
+    return out.join('');
+  }
+
+  async findLocation(locationId, workLocationName) {
+    const locs = await db.getAll('locations');
+    return locs.find((l) => String(l.locationId) === String(locationId || '')) ||
+           locs.find((l) => workLocationName && l.workLocationName === workLocationName) || null;
+  }
+
+  openImage(src) {
+    if (!src) return;
+    const v = document.createElement('div');
+    v.className = 'image-viewer';
+    v.innerHTML = `<img src="${src}" alt="Attendance photo" />`;
+    v.onclick = () => v.remove();
+    document.body.appendChild(v);
+  }
+
+  // Generic modal (used for password change, confirmations, outbox)
+  showGenericModal({ title, body, footer, onOpen, locked }) {
+    document.getElementById('generic-modal-title').textContent = title;
+    document.getElementById('generic-modal-body').innerHTML = body;
+    document.getElementById('generic-modal-footer').innerHTML = footer || `<button type="button" class="btn btn-outline" onclick="app.closeModal('generic-modal')">Close</button>`;
+    document.getElementById('generic-modal-close').style.display = locked ? 'none' : '';
+    this.openModal('generic-modal');
+    if (onOpen) onOpen();
+  }
+
   /* ---------- LANDOWNER RULE ----------
      A supervisor can only use landowners that are registered under the Work Location(s)
      assigned to that supervisor. Example: Farm 4 Block 1 is assigned to Francis, so Francis
@@ -106,6 +227,282 @@ class AttendanceApp {
     }
   }
 
+  /* ==========================================================================
+     THEMES
+     ========================================================================== */
+  getThemes() {
+    return [
+      { id: 'green', name: 'Coconut Green', desc: 'Default CocoTrack look', primary: '#15803d', p2: '#16a34a', page: '#f8fafc', surface: '#ffffff', bar: '#e2e8f0' },
+      { id: 'ocean', name: 'Ocean Blue', desc: 'Calm blue', primary: '#1d4ed8', p2: '#2563eb', page: '#f8fafc', surface: '#ffffff', bar: '#e2e8f0' },
+      { id: 'teal', name: 'Lagoon Teal', desc: 'Fresh blue-green', primary: '#0f766e', p2: '#0d9488', page: '#f8fafc', surface: '#ffffff', bar: '#e2e8f0' },
+      { id: 'sunset', name: 'Sunset Orange', desc: 'Warm and bright', primary: '#c2410c', p2: '#ea580c', page: '#f8fafc', surface: '#ffffff', bar: '#e2e8f0' },
+      { id: 'purple', name: 'Royal Purple', desc: 'Bold purple', primary: '#7e22ce', p2: '#9333ea', page: '#f8fafc', surface: '#ffffff', bar: '#e2e8f0' },
+      { id: 'rose', name: 'Rose Pink', desc: 'Soft pink', primary: '#be185d', p2: '#db2777', page: '#f8fafc', surface: '#ffffff', bar: '#e2e8f0' },
+      { id: 'earth', name: 'Copra Brown', desc: 'Earthy farm tones', primary: '#854d0e', p2: '#a16207', page: '#faf7f2', surface: '#ffffff', bar: '#e7e0d4' },
+      { id: 'sunlight', name: 'Sunlight Contrast', desc: 'Strong contrast for bright sun', primary: '#005c16', p2: '#007a1f', page: '#ffffff', surface: '#ffffff', bar: '#000000' }
+    ];
+  }
+
+  applyTheme(id) {
+    if (id === 'midnight') { id = 'green'; this.applyMode('dark'); } // v3.1 "Midnight" theme -> Green + Dark mode
+    const theme = this.getThemes().find((t) => t.id === id) || this.getThemes()[0];
+    if (theme.id === 'green') document.documentElement.removeAttribute('data-theme');
+    else document.documentElement.setAttribute('data-theme', theme.id);
+    try { localStorage.setItem('cocotrack-theme', theme.id); } catch (e) { /* storage may be unavailable */ }
+    const meta = document.querySelector('meta[name="theme-color"]');
+    this.currentTheme = theme.id;
+    this.applyMode(this.currentMode || 'light'); // Sunlight forces light; others keep the chosen mode
+    if (meta && document.documentElement.getAttribute('data-mode') !== 'dark') meta.setAttribute('content', theme.primary);
+  }
+
+  /* ---------- Dark mode: 'light' | 'dark' | 'auto' (follow the phone setting) ---------- */
+  applyMode(mode) {
+    this.currentMode = ['light', 'dark', 'auto'].includes(mode) ? mode : 'light';
+    try { localStorage.setItem('cocotrack-mode', this.currentMode); } catch (e) { /* ignore */ }
+    const systemDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+    const dark = (this.currentMode === 'dark' || (this.currentMode === 'auto' && systemDark)) && this.currentTheme !== 'sunlight';
+    if (dark) document.documentElement.setAttribute('data-mode', 'dark');
+    else document.documentElement.removeAttribute('data-mode');
+    const meta = document.querySelector('meta[name="theme-color"]');
+    const theme = this.getThemes().find((t) => t.id === this.currentTheme) || this.getThemes()[0];
+    if (meta) meta.setAttribute('content', dark ? '#0b1220' : theme.primary);
+    this.updateDarkToggleIcon(dark);
+
+    // In Auto, follow the phone when it switches between day and night
+    if (!this._modeListener && window.matchMedia) {
+      this._modeListener = () => { if (this.currentMode === 'auto') this.applyMode('auto'); };
+      const mq = window.matchMedia('(prefers-color-scheme: dark)');
+      if (mq.addEventListener) mq.addEventListener('change', this._modeListener);
+      else if (mq.addListener) mq.addListener(this._modeListener);
+    }
+  }
+
+  isDark() {
+    return document.documentElement.getAttribute('data-mode') === 'dark';
+  }
+
+  updateDarkToggleIcon(dark) {
+    const btn = document.getElementById('dark-toggle-btn');
+    if (!btn) return;
+    btn.title = dark ? 'Switch to light mode' : 'Switch to dark mode';
+    btn.innerHTML = dark
+      ? '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>'
+      : '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
+  }
+
+  async setMode(mode) {
+    if (this.currentTheme === 'sunlight' && mode !== 'light') {
+      this.showToast('Sunlight Contrast is a light theme. Pick another color theme to use dark mode.', 'info');
+      await this.setTheme('green');
+    }
+    this.applyMode(mode);
+    const user = auth.getCurrentUser();
+    if (user) await db.setSetting(`mode:${user.userId}`, this.currentMode);
+    document.querySelectorAll('.mode-switch button').forEach((b) => b.classList.toggle('active', b.dataset.mode === this.currentMode));
+    this.refreshCurrentView();
+  }
+
+  /** Top-bar button: one tap between light and dark. */
+  toggleDarkMode() {
+    this.setMode(this.isDark() ? 'light' : 'dark');
+  }
+
+  /** Each user keeps their own theme on this phone. */
+  async applyUserTheme() {
+    const user = auth.getCurrentUser();
+    if (!user) return;
+    const savedMode = await db.getSetting(`mode:${user.userId}`, null);
+    if (savedMode) this.currentMode = savedMode;
+    const saved = await db.getSetting(`theme:${user.userId}`, null);
+    if (saved) this.applyTheme(saved);
+    else this.applyMode(this.currentMode || 'light');
+  }
+
+  async setTheme(id) {
+    this.applyTheme(id);
+    const user = auth.getCurrentUser();
+    if (user) await db.setSetting(`theme:${user.userId}`, id);
+    document.querySelectorAll('.theme-card').forEach((c) => c.classList.toggle('active', c.dataset.theme === id));
+    this.refreshCurrentView();
+  }
+
+  openThemePicker() {
+    const cur = this.currentTheme || (document.documentElement.getAttribute('data-theme') || 'green');
+    this.showGenericModal({
+      title: '🎨 Choose a Theme',
+      body: `
+        <div style="font-weight:700;font-size:13px;margin-bottom:6px;">Mode</div>
+        <div class="mode-switch" role="group" aria-label="Light or dark mode">
+          ${[['light', '☀️ Light'], ['dark', '🌙 Dark'], ['auto', '📱 Auto']].map(([m, l]) => `<button type="button" data-mode="${m}" class="${(this.currentMode || 'light') === m ? 'active' : ''}" onclick="app.setMode('${m}')">${l}</button>`).join('')}
+        </div>
+        <div style="font-size:11px;color:var(--text-muted);margin:-8px 0 14px;">Auto follows your phone's day/night setting. Dark mode works with every color below except Sunlight Contrast.</div>
+        <div style="font-weight:700;font-size:13px;margin-bottom:6px;">Color</div>
+        <p style="font-size:13px;color:var(--text-muted);margin-bottom:12px;">Saved for ${auth.getCurrentUser() ? 'your account on this phone' : 'this phone'}. Other users keep their own theme.</p>
+        <div class="theme-grid">
+          ${this.getThemes().map((t) => `
+            <button type="button" class="theme-card ${t.id === cur ? 'active' : ''}" data-theme="${t.id}" onclick="app.setTheme('${t.id}')">
+              <div class="theme-preview" style="background:${t.page}">
+                <div class="tp-side" style="background:${t.surface}; border-right:1px solid ${t.bar}"></div>
+                <div class="tp-main">
+                  <div class="tp-bar" style="background:linear-gradient(135deg, ${t.primary}, ${t.p2})"></div>
+                  <div class="tp-bar" style="background:${t.bar}; width:80%"></div>
+                  <div class="tp-btn" style="background:${t.primary}"></div>
+                </div>
+              </div>
+              <div class="tc-name">${t.id === cur ? '✓ ' : ''}${this.escape(t.name)}</div>
+              <div class="tc-desc">${this.escape(t.desc)}</div>
+            </button>`).join('')}
+        </div>`
+    });
+  }
+
+  /* ==========================================================================
+     AVATARS (user profile pictures & employee registration photos)
+     ========================================================================== */
+  async loadAvatars() {
+    const [avatars, users] = await Promise.all([db.getAll('avatars'), db.getAll('users')]);
+    this.avatars = new Map(avatars.map((a) => [a.key, a.image]));
+    // supervisorId -> userId (admin phones have the user list)
+    this.userIdBySupervisor = new Map(users.filter((u) => u.linkedSupervisorId).map((u) => [String(u.linkedSupervisorId), String(u.userId)]));
+    const me = auth.getCurrentUser();
+    if (me && me.linkedSupervisorId) this.userIdBySupervisor.set(String(me.linkedSupervisorId), String(me.userId));
+    this.renderSidebarAvatar();
+  }
+
+  getAvatar(type, id) {
+    return (this.avatars && this.avatars.get(`${type}:${id}`)) || '';
+  }
+
+  supervisorAvatarKey(supervisorId) {
+    const uid = this.userIdBySupervisor && this.userIdBySupervisor.get(String(supervisorId));
+    return uid ? { type: 'USER', id: uid } : null;
+  }
+
+  avatarColor(name) {
+    let h = 0;
+    for (const ch of String(name || '?')) h = (h * 31 + ch.charCodeAt(0)) % 360;
+    return `hsl(${h}, 55%, 42%)`;
+  }
+
+  initials(name) {
+    const parts = String(name || '?').trim().split(/\s+/);
+    return ((parts[0] || '?')[0] + (parts.length > 1 ? parts[parts.length - 1][0] : '')).toUpperCase();
+  }
+
+  /** Round avatar: photo if we have one, otherwise colored initials. */
+  avatarHtml(type, id, name, size = 36, { onclick = '', markMissing = false } = {}) {
+    const img = type && id ? this.getAvatar(type, id) : '';
+    const cls = `avatar${onclick ? ' clickable' : ''}${!img && markMissing ? ' avatar-missing' : ''}`;
+    const click = onclick ? ` onclick="event.stopPropagation(); ${onclick}"` : '';
+    const title = img ? this.escape(name) : `${this.escape(name)}${markMissing ? ' – no photo yet' : ''}`;
+    return img
+      ? `<span class="${cls}" style="--size:${size}px" title="${title}"${click}><img src="${img}" alt="${this.escape(name)}" loading="lazy" /></span>`
+      : `<span class="${cls}" style="--size:${size}px; background:${this.avatarColor(name)}" title="${title}"${click}>${this.escape(this.initials(name))}</span>`;
+  }
+
+  employeeAvatar(emp, size = 36, opts = {}) {
+    return this.avatarHtml('EMPLOYEE', emp.employeeId, emp.employeeName, size, opts);
+  }
+
+  renderSidebarAvatar() {
+    const el = document.getElementById('user-display-avatar');
+    const user = auth.getCurrentUser();
+    if (!el || !user) return;
+    const img = this.getAvatar('USER', user.userId);
+    el.classList.toggle('has-photo', !!img);
+    el.innerHTML = img ? `<img src="${img}" alt="My photo" />` : this.escape(this.initials(user.name || user.username));
+    el.title = 'Change my profile photo';
+    el.onclick = () => this.openProfilePhotoModal('USER', user.userId, user.name || user.username);
+  }
+
+  /** Saves a photo locally right away, then online (or queued when offline). */
+  async saveProfilePhoto(type, ownerId, image, label) {
+    const key = `${type}:${ownerId}`;
+    if (image) await db.put('avatars', { key, type, ownerId: String(ownerId), image, updatedAt: new Date().toISOString() });
+    else await db.delete('avatars', key);
+    if (!this.avatars) this.avatars = new Map();
+    if (image) this.avatars.set(key, image); else this.avatars.delete(key);
+    this.renderSidebarAvatar();
+    try {
+      const res = await api.saveMaster('SAVE_PROFILE_PHOTO', { type, ownerId: String(ownerId), image }, label);
+      this.showToast(res.queued ? `${label}: saved on this phone, will upload when online.` : `${label}: saved.`, res.queued ? 'warning' : 'success');
+      this.updateSyncBadge();
+      return true;
+    } catch (err) {
+      this.showToast(`Photo not saved on the server: ${err.message}`, 'error');
+      return false;
+    }
+  }
+
+  /** Modal to view / take / upload / remove a profile photo. */
+  openProfilePhotoModal(type, ownerId, name) {
+    const me = auth.getCurrentUser() || {};
+    const canEdit = auth.isAdmin() || (type === 'USER' && String(ownerId) === String(me.userId)) || (type === 'EMPLOYEE' && auth.isSupervisor());
+    const img = this.getAvatar(type, ownerId);
+    const label = type === 'USER' ? `Profile photo of ${name}` : `Photo of ${name}`;
+    this.showGenericModal({
+      title: type === 'USER' ? '👤 Profile Photo' : '🪪 Employee Photo',
+      body: `
+        <div style="display:flex;flex-direction:column;align-items:center;gap:12px;">
+          ${img ? `<img src="${img}" alt="${this.escape(name)}" style="width:200px;height:200px;border-radius:50%;object-fit:cover;cursor:zoom-in;" onclick="app.openImage(this.src)" />`
+                : this.avatarHtml(type, ownerId, name, 160)}
+          <div style="font-weight:700;font-size:16px;">${this.escape(name)}</div>
+          <div style="font-size:12px;color:var(--text-muted);">${img ? 'Tap the photo to enlarge.' : 'No photo yet.'}</div>
+        </div>`,
+      footer: `
+        <button type="button" class="btn btn-outline" onclick="app.closeModal('generic-modal')">Close</button>
+        ${canEdit && img ? `<button type="button" class="btn btn-danger" id="pp-remove">Remove</button>` : ''}
+        ${canEdit ? `<button type="button" class="btn btn-primary" id="pp-take">📷 ${img ? 'Change' : 'Add'} Photo</button>` : ''}`,
+      onOpen: () => {
+        const take = document.getElementById('pp-take');
+        if (take) take.onclick = async () => {
+          this.closeModal('generic-modal');
+          const shot = await camera.pickProfilePhoto({ title: label, facing: type === 'USER' && String(ownerId) === String(me.userId) ? 'user' : 'environment' });
+          if (!shot) return;
+          await this.saveProfilePhoto(type, ownerId, shot, label);
+          this.refreshCurrentView();
+        };
+        const rm = document.getElementById('pp-remove');
+        if (rm) rm.onclick = async () => {
+          if (!confirm(`Remove the photo of ${name}?`)) return;
+          this.closeModal('generic-modal');
+          await this.saveProfilePhoto(type, ownerId, '', label);
+          this.refreshCurrentView();
+        };
+      }
+    });
+  }
+
+  /** Employee form: take/upload a registration photo (kept until the form is saved). */
+  async captureEmployeePhoto() {
+    const name = document.getElementById('emp-name-input').value.trim() || 'New employee';
+    const shot = await camera.pickProfilePhoto({ title: `Registration photo – ${name}`, facing: 'environment' });
+    if (!shot) return;
+    this.pendingEmployeePhoto = shot;
+    this.renderEmployeePhotoPreview();
+  }
+
+  removeEmployeePhoto() {
+    this.pendingEmployeePhoto = 'REMOVE';
+    this.renderEmployeePhotoPreview();
+  }
+
+  renderEmployeePhotoPreview() {
+    const box = document.getElementById('emp-photo-preview');
+    if (!box) return;
+    const emp = this.currentEditEmployee;
+    let img = '';
+    if (this.pendingEmployeePhoto && this.pendingEmployeePhoto !== 'REMOVE') img = this.pendingEmployeePhoto;
+    else if (!this.pendingEmployeePhoto && emp) img = this.getAvatar('EMPLOYEE', emp.employeeId);
+    box.innerHTML = img
+      ? `<span class="avatar" style="--size:96px"><img src="${img}" alt="Employee photo" /></span>`
+      : `<span class="avatar avatar-missing" style="--size:96px; background:var(--bg-hover); color:var(--text-muted); font-size:30px;">📷</span>`;
+    const rm = document.getElementById('emp-photo-remove');
+    if (rm) rm.style.display = img ? 'inline-flex' : 'none';
+    const btn = document.getElementById('emp-photo-btn');
+    if (btn) btn.textContent = img ? '📷 Retake / Change Photo' : '📷 Take or Upload Photo';
+  }
+
   async init() {
     console.log('[App] Initializing application...');
 
@@ -115,6 +512,20 @@ class AttendanceApp {
     // Check existing session
     const user = await auth.initSession();
     this.sessionLandowner = await db.getSetting('sessionLandowner', null);
+    this.currentTheme = document.documentElement.getAttribute('data-theme') || 'green';
+    try { this.currentMode = localStorage.getItem('cocotrack-mode') || 'light'; } catch (e) { this.currentMode = 'light'; }
+    if (localStorage.getItem && (await db.getSetting('migratedMidnight', false)) === false) {
+      // users who picked the old "Midnight" theme keep dark mode
+      const u = auth.getCurrentUser();
+      if (u && (await db.getSetting(`theme:${u.userId}`, null)) === 'midnight') {
+        await db.setSetting(`theme:${u.userId}`, 'green');
+        await db.setSetting(`mode:${u.userId}`, 'dark');
+      }
+      await db.setSetting('migratedMidnight', true);
+    }
+    await this.applyUserTheme();
+    this.applyMode(this.currentMode);
+    await this.loadAvatars();
 
     // Register Service Worker
     this.registerServiceWorker();
@@ -127,6 +538,9 @@ class AttendanceApp {
 
     // Subscribe to Sync updates
     syncService.subscribe((event) => this.handleSyncEvent(event));
+
+    // Server says the session/account is no longer valid
+    window.addEventListener('cocotrack:auth-invalid', (ev) => this.handleAuthInvalid(ev.detail));
 
     // Update connection badge
     this.updateNetworkBadge();
@@ -141,6 +555,7 @@ class AttendanceApp {
         syncService.autoSync();
         syncService.pullRemoteData(); // keeps assigned locations / landowners up to date
       }
+      if (user.mustChangePassword) setTimeout(() => this.openChangePasswordModal(true), 400);
     } else {
       this.showLoginView();
     }
@@ -150,7 +565,7 @@ class AttendanceApp {
   registerServiceWorker() {
     if ('serviceWorker' in navigator) {
       navigator.serviceWorker.register('./sw.js')
-        .then((reg) => console.log('[SW] Service Worker registered. Scope:', reg.scope))
+        .then((reg) => console.log('[SW] Service Worker registered.', reg && reg.scope))
         .catch((err) => console.warn('[SW] Service Worker registration failed:', err));
     }
   }
@@ -204,6 +619,24 @@ class AttendanceApp {
     }
   }
 
+  // Shows the number of items waiting to upload on the header Sync button
+  async updateSyncBadge() {
+    const btn = document.getElementById('quick-sync-btn');
+    if (!btn) return;
+    const stats = await syncService.getSyncStats();
+    const n = stats.pendingRecords + stats.failedRecords + stats.pendingPhotos + stats.outboxCount;
+    let badge = btn.querySelector('.sync-count');
+    if (!badge) {
+      badge = document.createElement('span');
+      badge.className = 'sync-count';
+      badge.style.cssText = 'background:#f59e0b;color:#fff;border-radius:999px;font-size:10px;font-weight:700;padding:1px 6px;margin-left:4px;';
+      btn.appendChild(badge);
+    }
+    badge.textContent = n;
+    badge.style.display = n ? 'inline-block' : 'none';
+    badge.style.background = stats.failedRecords || stats.failedPhotos || stats.outboxFailed ? '#ef4444' : '#f59e0b';
+  }
+
   updateNetworkBadge() {
     const isOnline = navigator.onLine;
     const badge = document.getElementById('network-status-badge');
@@ -218,6 +651,19 @@ class AttendanceApp {
     }
   }
 
+  async handleAuthInvalid(detail) {
+    if (this._authInvalidShown) return;
+    this._authInvalidShown = true;
+    await auth.invalidate(detail.code);
+    this.showLoginView();
+    const errEl = document.getElementById('login-error-alert');
+    if (errEl) {
+      errEl.textContent = `${detail.message} Your unsent records are still saved on this phone and will upload after you sign in.`;
+      errEl.style.display = 'block';
+    }
+    setTimeout(() => { this._authInvalidShown = false; }, 3000);
+  }
+
   handleSyncEvent(event) {
     if (event.type === 'NETWORK_CHANGE') {
       this.updateNetworkBadge();
@@ -227,14 +673,17 @@ class AttendanceApp {
         this.showToast('You are offline. Attendance will be saved locally.', 'warning');
       }
     } else if (event.type === 'SYNC_COMPLETE') {
-      this.showToast(event.count > 0 ? `Synchronized ${event.count} records!` : 'Database is up to date.', 'success');
+      if (event.problems) this.showToast(`${event.message} ${event.problems} item(s) need attention – see the Sync page.`, 'warning');
+      else if (!event.silent || event.count > 0) this.showToast(event.message || 'Database is up to date.', 'success');
+      this.updateSyncBadge();
       this.refreshCurrentView();
     } else if (event.type === 'SYNC_ERROR') {
-      this.showToast(`Sync issue: ${event.error}`, 'error');
+      if (!['AUTH_REQUIRED', 'AUTH_EXPIRED', 'ACCOUNT_DISABLED'].includes(event.code)) this.showToast(`Sync issue: ${event.error}`, 'error');
+      this.updateSyncBadge();
       this.refreshCurrentView();
     } else if (event.type === 'DATA_PULLED') {
       this.lastDataPull = new Date();
-      this.validateSessionLandowner().then(() => this.refreshCurrentView());
+      Promise.all([this.validateSessionLandowner(), this.loadAvatars()]).then(() => this.refreshCurrentView());
     }
   }
 
@@ -297,6 +746,9 @@ class AttendanceApp {
     const logoutBtn = document.getElementById('logout-btn');
     if (logoutBtn) {
       logoutBtn.addEventListener('click', async () => {
+        const stats = await syncService.getSyncStats();
+        const waiting = stats.pendingRecords + stats.failedRecords + stats.pendingPhotos;
+        if (waiting && !confirm(`${waiting} item(s) are not uploaded yet. They stay saved on this phone and will upload the next time you sign in online. Sign out anyway?`)) return;
         await auth.logout();
         this.showLoginView();
       });
@@ -345,12 +797,13 @@ class AttendanceApp {
 
     if (userNameEl) userNameEl.textContent = user.name || user.username;
     if (userRoleEl) userRoleEl.textContent = `${user.role} ${user.isOfflineSession ? '(Offline)' : ''}`;
-    if (userAvatarEl) userAvatarEl.textContent = (user.name || user.username).charAt(0).toUpperCase();
+    if (userAvatarEl) this.renderSidebarAvatar();
 
     // Render navigation links based on Role
     this.renderNavigation();
     this.renderGpsPill();
     this.updateNetworkBadge();
+    this.updateSyncBadge();
 
     // Update active landowner pill for supervisor area checking
     const sessionLandownerPill = document.getElementById('session-landowner-pill');
@@ -388,6 +841,7 @@ class AttendanceApp {
       opt.value = l.landownerName;
       opt.dataset.id = l.landownerId;
       opt.dataset.location = l.workLocation || '';
+      opt.dataset.locationId = l.locationId || '';
       opt.textContent = `${l.landownerName}${l.workLocation ? ' (' + l.workLocation + ')' : ''}`;
       if (this.sessionLandowner && this.sessionLandowner.name === l.landownerName) {
         opt.selected = true;
@@ -421,15 +875,14 @@ class AttendanceApp {
 
     let lndName = '';
     let lndId = '';
+    let locId = '';
     let workLoc = locInput ? locInput.value.trim() : '';
 
     const selectedOpt = select.options[select.selectedIndex];
-    if (customInput && customInput.value.trim()) {
-      lndName = customInput.value.trim();
-      lndId = `LND-CUST-${Date.now()}`;
-    } else if (selectedOpt && selectedOpt.value) {
+    if (selectedOpt && selectedOpt.value) {
       lndName = selectedOpt.value;
       lndId = selectedOpt.dataset.id || '';
+      locId = selectedOpt.dataset.locationId || '';
       if (!workLoc && selectedOpt.dataset.location) {
         workLoc = selectedOpt.dataset.location;
       }
@@ -443,6 +896,7 @@ class AttendanceApp {
     const landownerObj = {
       id: lndId,
       name: lndName,
+      locationId: locId,
       workLocation: workLoc
     };
 
@@ -478,9 +932,25 @@ class AttendanceApp {
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
         <span>Attendance History</span>
       </div>
+      <div class="nav-item ${this.currentView === 'reports' ? 'active' : ''}" onclick="app.navigateTo('reports')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>
+        <span>Cut-off Summary</span>
+      </div>
       <div class="nav-item ${this.currentView === 'sync' ? 'active' : ''}" onclick="app.navigateTo('sync')">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
         <span>Sync Dashboard</span>
+      </div>
+      <div class="nav-item" onclick="app.openThemePicker()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="13.5" cy="6.5" r="1.5"/><circle cx="17.5" cy="10.5" r="1.5"/><circle cx="8.5" cy="7.5" r="1.5"/><circle cx="6.5" cy="12.5" r="1.5"/><path d="M12 2a10 10 0 0 0 0 20c1.1 0 2-.9 2-2 0-.5-.2-1-.5-1.3-.3-.4-.5-.8-.5-1.3 0-1.1.9-2 2-2h2.4A5.6 5.6 0 0 0 23 10 10 10 0 0 0 12 2z"/></svg>
+        <span>Theme</span>
+      </div>
+      <div class="nav-item" onclick="app.openProfilePhotoModal('USER', auth.getCurrentUser().userId, auth.getCurrentUser().name || auth.getCurrentUser().username)">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+        <span>My Profile Photo</span>
+      </div>
+      <div class="nav-item" onclick="app.openChangePasswordModal(false)">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+        <span>Change My Password</span>
       </div>
     `;
 
@@ -510,6 +980,10 @@ class AttendanceApp {
         <div class="nav-item ${this.currentView === 'audit' ? 'active' : ''}" onclick="app.navigateTo('audit')">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
           <span>Audit Logs</span>
+        </div>
+        <div class="nav-item ${this.currentView === 'appsettings' ? 'active' : ''}" onclick="app.navigateTo('appsettings')">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"/></svg>
+          <span>Photo, GPS & Pay Rules</span>
         </div>
       `;
     }
@@ -581,6 +1055,7 @@ class AttendanceApp {
   }
 
   renderCurrentView() {
+    if (!auth.getCurrentUser()) return; // nothing renders behind the login screen
     const container = document.getElementById('view-content-root');
     const titleEl = document.getElementById('page-title-text');
     if (!container) return;
@@ -643,6 +1118,17 @@ class AttendanceApp {
         this.renderAuditView(container);
         break;
 
+      case 'reports':
+        if (titleEl) titleEl.textContent = 'Cut-off Summary';
+        this.renderReportsView(container);
+        break;
+
+      case 'appsettings':
+        if (!auth.isAdmin()) { this.navigateTo('dashboard'); return; }
+        if (titleEl) titleEl.textContent = 'Photo, GPS & Pay Rules';
+        this.renderAppSettingsView(container);
+        break;
+
       default:
         this.renderDashboard(container);
     }
@@ -656,7 +1142,7 @@ class AttendanceApp {
     if (!root) return;
 
     root.innerHTML = `
-      <div class="login-card" style="width: 100%; max-width: 440px; padding: 32px; background: #ffffff; border-radius: 16px; box-shadow: var(--shadow-lg); border: 1px solid var(--border);">
+      <div class="login-card" style="width: 100%; max-width: 440px; padding: 32px; background: var(--bg-surface); border-radius: 16px; box-shadow: var(--shadow-lg); border: 1px solid var(--border);">
         <div style="text-align: center; margin-bottom: 24px;">
           <img src="icons/logo-full.png" class="login-logo" alt="CocoTrack Attendance & Monitoring" />
           <p style="font-size: 13px; color: var(--text-muted); margin-top: 10px;">Online & Offline Mobile Attendance Monitoring</p>
@@ -684,13 +1170,17 @@ class AttendanceApp {
           <span style="font-size: 12px; color: var(--text-muted);">
             Network: <strong id="login-network-status">${navigator.onLine ? 'Online' : 'Offline'}</strong>
           </span>
-          <button type="button" class="btn btn-outline" style="font-size: 12px; padding: 4px 10px;" onclick="app.openSettingsModal()">
-            ⚙ API Settings
-          </button>
+          <span style="display:flex; gap:6px;">
+            <button type="button" class="btn btn-outline" style="font-size: 12px; padding: 4px 10px;" onclick="app.toggleDarkMode()" title="Dark mode">🌙</button>
+            <button type="button" class="btn btn-outline" style="font-size: 12px; padding: 4px 10px;" onclick="app.openThemePicker()" title="Theme">🎨</button>
+            <button type="button" class="btn btn-outline" style="font-size: 12px; padding: 4px 10px;" onclick="app.openSettingsModal()">
+              ⚙ API Settings
+            </button>
+          </span>
         </div>
 
         <div style="margin-top: 12px; font-size: 11px; color: var(--text-light); text-align: center;">
-          Default setup login: <strong>admin</strong> / <strong>admin123</strong>
+          First login on a new phone needs internet. After that you can sign in offline.
         </div>
       </div>
     `;
@@ -710,19 +1200,23 @@ class AttendanceApp {
         const res = await auth.login(username, password);
 
         // Download this account's latest locations / landowners, then drop any area that is not theirs
-        const apiUrl = await db.getSetting('apiUrl', '');
-        if (navigator.onLine && apiUrl && res.mode === 'online') {
+        if (res.mode === 'online') {
           submitBtn.textContent = 'Loading your areas...';
           await syncService.pullRemoteData();
+          syncService.autoSync(); // upload anything left from an earlier session
         }
         await this.validateSessionLandowner();
+        await this.applyUserTheme();
+        await this.loadAvatars();
 
         this.showToast(res.message, res.mode === 'offline' ? 'warning' : 'success');
         this.renderAppShell();
         this.navigateTo('dashboard');
 
-        // If supervisor logged in without selecting landowner, prompt them immediately
-        if (auth.isSupervisor() && (!this.sessionLandowner || !this.sessionLandowner.name)) {
+        if (res.user.mustChangePassword && res.mode === 'online') {
+          setTimeout(() => this.openChangePasswordModal(true), 350);
+        } else if (auth.isSupervisor() && (!this.sessionLandowner || !this.sessionLandowner.name)) {
+          // If supervisor logged in without selecting landowner, prompt them immediately
           setTimeout(() => this.promptSelectSessionLandowner(), 350);
         }
       } catch (err) {
@@ -783,7 +1277,7 @@ class AttendanceApp {
 
     container.innerHTML = `
       ${!isAdmin ? `
-        <div class="content-card banner-card" style="background: linear-gradient(135deg, #15803d, #16a34a); color: #ffffff; padding: 16px 20px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-bottom: 20px;">
+        <div class="content-card banner-card" style="background: linear-gradient(135deg, var(--primary), var(--primary-2)); color: #ffffff; padding: 16px 20px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-bottom: 20px;">
           <div style="display: flex; align-items: center; gap: 14px;">
             <div style="width: 44px; height: 44px; border-radius: 50%; background: rgba(255,255,255,0.2); display: flex; align-items: center; justify-content: center; font-size: 22px;">🌾</div>
             <div>
@@ -861,7 +1355,7 @@ class AttendanceApp {
       </div>
 
       <!-- Quick Action Banner -->
-      <div class="content-card banner-card" style="background: linear-gradient(135deg, #15803d, #16a34a); color: #ffffff; padding: 20px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-bottom: 24px;">
+      <div class="content-card banner-card" style="background: linear-gradient(135deg, var(--primary), var(--primary-2)); color: #ffffff; padding: 20px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-bottom: 24px;">
         <div>
           <h3 style="font-size: 18px; font-weight: 700; margin-bottom: 4px;">Ready to record attendance?</h3>
           <p style="font-size: 13px; opacity: 0.9;">Time IN and Time OUT work seamlessly offline and online.</p>
@@ -870,6 +1364,8 @@ class AttendanceApp {
           Go to Attendance
         </button>
       </div>
+
+      <div id="cutoff-host"></div>
 
       <!-- Summary by Date and Location -->
       <div class="content-card">
@@ -917,6 +1413,7 @@ class AttendanceApp {
         </div>
       </div>
     `;
+    this.renderCutoffSection(document.getElementById('cutoff-host'), { compact: true });
   }
 
   /* ==========================================================================
@@ -953,7 +1450,7 @@ class AttendanceApp {
     const r = 70, cx = 90, cy = 90, sw = 28;
     const C = 2 * Math.PI * r;
     let offset = 0;
-    let rings = `<circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="#e2e8f0" stroke-width="${sw}"/>`;
+    let rings = `<circle cx="${cx}" cy="${cy}" r="${r}" fill="none" style="stroke:var(--border)" stroke-width="${sw}"/>`;
     if (total > 0) {
       segments.forEach((seg) => {
         if (seg.value <= 0) return;
@@ -966,8 +1463,8 @@ class AttendanceApp {
     return `
       <svg viewBox="0 0 180 180" class="donut-svg" role="img" aria-label="Attendance pie chart">
         ${rings}
-        <text x="${cx}" y="${cy + 4}" text-anchor="middle" font-size="28" font-weight="700" fill="#0f172a">${centerBig}</text>
-        <text x="${cx}" y="${cy + 24}" text-anchor="middle" font-size="11" fill="#64748b">${centerSmall}</text>
+        <text x="${cx}" y="${cy + 4}" text-anchor="middle" font-size="28" font-weight="700" style="fill:var(--text-main)">${centerBig}</text>
+        <text x="${cx}" y="${cy + 24}" text-anchor="middle" font-size="11" style="fill:var(--text-muted)">${centerSmall}</text>
       </svg>`;
   }
 
@@ -989,9 +1486,9 @@ class AttendanceApp {
       const dt = new Date(d.date + 'T00:00:00');
       const lbl = dt.toLocaleDateString([], { weekday: 'short' });
       bars += `<g><title>${d.date}: ${noData ? 'no records' : d.present + ' present, ' + d.leave + ' on leave, ' + d.absent + ' absent'}</title>
-        ${noData ? `<rect x="${x}" y="${H - padB - 6}" width="${bw}" height="6" fill="#e2e8f0" rx="2"/>` : seg(hp, '#16a34a') + seg(hl, '#f59e0b') + seg(ha, '#fca5a5')}
-        <text x="${x + bw / 2}" y="${H - 12}" text-anchor="middle" font-size="10" fill="#64748b">${lbl}</text>
-        <text x="${x + bw / 2}" y="${H - 1}" text-anchor="middle" font-size="9" fill="#94a3b8">${dt.getDate()}</text></g>`;
+        ${noData ? `<rect x="${x}" y="${H - padB - 6}" width="${bw}" height="6" style="fill:var(--border)" rx="2"/>` : seg(hp, '#16a34a') + seg(hl, '#f59e0b') + seg(ha, '#fca5a5')}
+        <text x="${x + bw / 2}" y="${H - 12}" text-anchor="middle" font-size="10" style="fill:var(--text-muted)">${lbl}</text>
+        <text x="${x + bw / 2}" y="${H - 1}" text-anchor="middle" font-size="9" style="fill:var(--text-light)">${dt.getDate()}</text></g>`;
     });
     return `<svg viewBox="0 0 ${W} ${H}" class="trend-svg" role="img" aria-label="7 day attendance trend">${bars}</svg>`;
   }
@@ -1225,8 +1722,10 @@ class AttendanceApp {
           </div>
         </div>
         `}
+        <div id="cutoff-host"></div>
       </div>
     `;
+    this.renderCutoffSection(document.getElementById('cutoff-host'), { compact: true });
 
     // Pull the newest data from Google Sheets when the dashboard is opened (at most once a minute)
     if (navigator.onLine && Date.now() - (this._lastAdminPull || 0) > 60000) {
@@ -1321,13 +1820,7 @@ class AttendanceApp {
       return;
     }
     const csv = '\uFEFF' + [headers.map((h) => this.csvCell(h)).join(','), ...lines].join('\r\n');
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `Attendance_Day_Report_${data.date}.csv`;
-    a.click();
-    URL.revokeObjectURL(url);
+    this.downloadText(csv, `Attendance_Day_Report_${data.date}.csv`);
   }
 
   /* ==========================================================================
@@ -1383,8 +1876,8 @@ class AttendanceApp {
 
       for (const d of dates) {
         if (taken.has(d)) { skipped.push(d); continue; }
-        await db.put('attendance', {
-          attendanceRecordId: `REC-LV-${Date.now()}-${Math.random().toString(36).substring(2, 7).toUpperCase()}`,
+        await db.saveAttendance({
+          attendanceRecordId: this.newRecordId('REC-LV'),
           employeeId: emp.employeeId,
           employeeName: emp.employeeName,
           supervisorId: emp.supervisorId || currentUser.linkedSupervisorId || '',
@@ -1404,7 +1897,6 @@ class AttendanceApp {
           actualGpsOut: '',
           deviceTimestamp: nowIso,
           synchronizationDate: '',
-          syncStatus: 'PENDING',
           recordStatus: 'ACTIVE',
           attendanceType: 'LEAVE',
           leaveType: leaveType,
@@ -1436,8 +1928,8 @@ class AttendanceApp {
       const rec = await db.get('attendance', recordId);
       if (!rec) throw new Error('Leave record not found.');
       rec.recordStatus = 'DELETED';
-      rec.syncStatus = 'PENDING';
-      await db.put('attendance', rec);
+      rec.deleteReason = `${rec.leaveType || 'Leave'} cancelled`;
+      await db.saveAttendance(rec);
 
       const currentUser = auth.getCurrentUser() || {};
       await db.put('auditLogs', {
@@ -1467,12 +1959,15 @@ class AttendanceApp {
     const isAdmin = auth.isAdmin();
     const supervisorId = auth.getLinkedSupervisorId();
 
-    const [allEmployees, allAttendance, landowners, locations] = await Promise.all([
+    const [allEmployees, allAttendance, landowners, locations, allPhotos] = await Promise.all([
       db.getAll('employees'),
       db.getAll('attendance'),
       db.getAll('landowners'),
-      db.getAll('locations')
+      db.getAll('locations'),
+      db.getAll('photos')
     ]);
+    const photosByRecord = {};
+    allPhotos.forEach((p) => { (photosByRecord[p.recordId] = photosByRecord[p.recordId] || {})[p.kind] = p; });
 
     // Filter strictly by supervisor
     let employees = allEmployees.filter((e) => e.employmentStatus === 'Active');
@@ -1489,7 +1984,7 @@ class AttendanceApp {
 
     container.innerHTML = `
       <!-- Active Area Checking Banner for Supervisor -->
-      <div class="content-card banner-card" style="background: linear-gradient(135deg, #15803d, #16a34a); color: #ffffff; padding: 16px 20px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-bottom: 20px;">
+      <div class="content-card banner-card" style="background: linear-gradient(135deg, var(--primary), var(--primary-2)); color: #ffffff; padding: 16px 20px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-bottom: 20px;">
         <div style="display: flex; align-items: center; gap: 14px;">
           <div style="width: 44px; height: 44px; border-radius: 50%; background: rgba(255,255,255,0.2); display: flex; align-items: center; justify-content: center; font-size: 22px;">🌾</div>
           <div>
@@ -1526,7 +2021,7 @@ class AttendanceApp {
       </div>
     `;
 
-    this.cachedRecordingData = { employees, allAttendance, todayDate };
+    this.cachedRecordingData = { employees, allAttendance, todayDate, photosByRecord };
     this.filterAttendanceList();
   }
 
@@ -1537,7 +2032,7 @@ class AttendanceApp {
     const query = (document.getElementById('att-search-input')?.value || '').toLowerCase().trim();
     const selectedLocation = document.getElementById('att-filter-location')?.value || '';
 
-    const { employees, allAttendance, todayDate } = this.cachedRecordingData;
+    const { employees, allAttendance, todayDate, photosByRecord } = this.cachedRecordingData;
 
     const filtered = employees.filter((emp) => {
       const matchQuery = emp.employeeName.toLowerCase().includes(query) || emp.employeeId.toLowerCase().includes(query);
@@ -1577,13 +2072,16 @@ class AttendanceApp {
       return `
         <div class="emp-attendance-card">
           <div class="emp-card-header">
-            <div>
+            <div style="display:flex; gap:12px; align-items:flex-start; min-width:0;">
+              ${this.employeeAvatar(emp, 52, { markMissing: true, onclick: `app.openProfilePhotoModal('EMPLOYEE', '${this.escape(emp.employeeId)}', '${this.escape(emp.employeeName).replace(/&#39;/g, '')}')` })}
+              <div style="min-width:0;">
               <span class="emp-id-badge">${this.escape(emp.employeeId)}</span>
               <div class="emp-name">${this.escape(emp.employeeName)}</div>
               <div class="emp-location-info">
                 <span>📍 Location: <strong>${this.escape(emp.workLocation || 'Unassigned')}</strong></span>
                 <span>🌾 Landowner Area: <strong>${this.escape(todayRec?.landownerName || (this.sessionLandowner ? this.sessionLandowner.name : 'Pending Time IN'))}</strong></span>
                 <span>👤 Supervisor: ${this.escape(emp.supervisorName || 'Unassigned')}</span>
+              </div>
               </div>
             </div>
             <div style="display: flex; flex-direction: column; align-items: flex-end; gap: 6px;">
@@ -1614,10 +2112,20 @@ class AttendanceApp {
           </div>
 
           ${todayRec?.actualGpsIn ? `
-            <div style="font-size: 11px; color: var(--text-muted); background: #f8fafc; padding: 4px 8px; border-radius: 4px;">
+            <div style="font-size: 11px; color: var(--text-muted); background: var(--bg-page); padding: 4px 8px; border-radius: 4px;">
               Actual GPS: ${this.escape(todayRec.actualGpsIn)}
             </div>
           ` : ''}
+
+          ${todayRec && !isLeave ? (() => {
+            const ph = photosByRecord[todayRec.attendanceRecordId] || {};
+            const thumbs = ['IN', 'OUT'].filter((k) => ph[k]).map((k) =>
+              `<img src="${ph[k].thumbUrl}" alt="${k} photo" title="Time ${k} photo" onclick="app.viewPhoto('${todayRec.attendanceRecordId}', '${k}')" />`).join('');
+            const flags = this.renderFlags(todayRec);
+            return (thumbs || flags) ? `<div style="display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap;">
+              <div class="photo-thumbs">${thumbs}</div><div>${flags}</div></div>` : '';
+          })() : ''}
+          ${todayRec?.syncError ? `<div class="sync-error-text">Upload problem: ${this.escape(todayRec.syncError)}</div>` : ''}
 
           <!-- Large Action Buttons -->
           <div class="emp-actions">
@@ -1665,10 +2173,102 @@ class AttendanceApp {
     this.showToast(this.activeGps.coords ? `GPS Acquired: ${this.activeGps.coords}` : 'GPS not available.', this.activeGps.coords ? 'success' : 'warning');
   }
 
-  // Record Standard Time IN
+  updateActiveGpsFromPos(pos) {
+    if (pos && !pos.error) {
+      this.activeGps = { coords: `${pos.lat.toFixed(6)}, ${pos.lng.toFixed(6)}`, accuracy: pos.acc, status: 'Acquired' };
+    } else {
+      this.activeGps = { coords: '', accuracy: null, status: pos && pos.error === 'PERMISSION_DENIED' ? 'Permission Denied' : 'No signal' };
+    }
+    this.renderGpsPill();
+  }
+
+  /**
+   * Shared by Time IN and Time OUT: fresh GPS -> geofence rule -> camera + watermark.
+   * Returns { pos, gf, photo, takenAt, skipped } or null if the user cancelled / it was blocked.
+   */
+  async capturePunch(kind, { emp, recordId, landowner, workLocation, locationId }) {
+    const settings = await auth.getAppSettings();
+    const currentUser = auth.getCurrentUser() || {};
+    const label = kind === 'OUT' ? 'Time OUT' : 'Time IN';
+
+    this.showToast('Getting a fresh GPS location...', 'info');
+    const pos = await geo.getFreshPosition(15000);
+    this.updateActiveGpsFromPos(pos);
+
+    const loc = await this.findLocation(locationId, workLocation);
+    const gf = geo.check(pos, loc, settings);
+    const mode = settings.geofenceMode;
+
+    if (mode === 'block') {
+      if (gf.status === 'OUTSIDE') {
+        throw new Error(`${label} blocked: you are ${gf.distance} m from ${loc.workLocationName} (allowed ${gf.radius} m). Move closer to the work area and try again.`);
+      }
+      if (gf.status === 'NO_GPS') {
+        throw new Error(`${label} blocked: GPS is required. Turn on Location (high accuracy) and try again.`);
+      }
+    } else if (mode === 'warn') {
+      if (gf.status === 'OUTSIDE' && !confirm(`Warning: you are ${gf.distance} m away from ${loc.workLocationName} (allowed ${gf.radius} m).\n\nRecord ${label} anyway? It will be flagged for the admin.`)) return null;
+      if (gf.status === 'NO_GPS' && !confirm(`No GPS signal.\n\nRecord ${label} without location? It will be flagged for the admin.`)) return null;
+    }
+
+    let photo = null;
+    let takenAt = new Date();
+    let skipped = false;
+    if (settings.photoMode !== 'off') {
+      const res = await camera.capture({
+        kind,
+        employeeName: emp.employeeName,
+        employeeId: emp.employeeId,
+        employeePhoto: this.getAvatar('EMPLOYEE', emp.employeeId),
+        landowner,
+        workLocation,
+        gpsText: geo.format(pos),
+        geofenceText: mode !== 'off' ? this.geofenceLabel(gf.status, gf.distance, gf.radius) : '',
+        supervisor: currentUser.name || currentUser.username || '',
+        recordId,
+        allowSkip: settings.photoMode === 'optional'
+      });
+      if (!res) {
+        this.showToast(`${label} cancelled. Nothing was saved.`, 'warning');
+        return null;
+      }
+      if (res.skipped) skipped = true;
+      else { photo = res; takenAt = res.takenAt; }
+    }
+
+    const geoStatus = gf.status === 'INSIDE' || gf.status === 'OUTSIDE'
+      ? gf.status + (gf.lowAccuracy ? '_LOW_ACCURACY' : '')
+      : gf.status;
+    return { pos, gf, geoStatus, photo, takenAt, skipped };
+  }
+
+  async savePunchPhoto(recordId, kind, photo) {
+    if (!photo) return;
+    await db.put('photos', {
+      photoId: `${recordId}-${kind}`,
+      recordId,
+      kind,
+      dataUrl: photo.dataUrl,
+      thumbUrl: photo.thumbUrl,
+      source: photo.source || 'camera',
+      takenAt: photo.takenAt.toISOString(),
+      syncStatus: 'PENDING',
+      error: ''
+    });
+  }
+
+  afterPunchSaved() {
+    this.renderAttendanceRecording(document.getElementById('view-content-root'));
+    this.updateSyncBadge();
+    syncService.requestBackgroundSync();
+    if (navigator.onLine) syncService.autoSync();
+  }
+
+  // Record Time IN (fresh GPS + geofence + watermarked photo)
   async recordTimeIn(employeeId) {
+    if (this._punchBusy) return;
+    this._punchBusy = true;
     try {
-      // Ensure active Landowner area is selected for area checking
       if (!this.sessionLandowner || !this.sessionLandowner.name) {
         this.promptSelectSessionLandowner();
         this.showToast('Please select the Landowner area you are checking before recording Time IN.', 'warning');
@@ -1678,114 +2278,143 @@ class AttendanceApp {
       const emp = await db.get('employees', employeeId);
       if (!emp) throw new Error('Employee not found');
 
-      const todayDate = this.todayStr();
-      const allAtt = await db.getAll('attendance');
-      const existing = allAtt.find(
-        (a) => String(a.employeeId) === String(employeeId) && this.ymd(a.attendanceDate) === todayDate && a.recordStatus !== 'DELETED'
+      const findToday = async () => (await db.getAll('attendance')).find(
+        (a) => String(a.employeeId) === String(employeeId) && this.ymd(a.attendanceDate) === this.todayStr() && a.recordStatus !== 'DELETED'
       );
+      let existing = await findToday();
+      if (existing && this.isLeave(existing)) throw new Error('This employee is marked On Leave today. Cancel the leave first to record Time IN.');
+      if (existing && existing.timeIn) throw new Error('Employee already has a Time IN record for today.');
 
-      if (existing && this.isLeave(existing)) {
-        throw new Error('This employee is marked On Leave today. Cancel the leave first to record Time IN.');
-      }
-      if (existing && existing.timeIn) {
-        throw new Error('Employee already has an active Time IN record for today.');
-      }
+      const recordId = this.newRecordId();
+      const sl = this.sessionLandowner;
+      const locationId = sl.locationId || emp.locationId || '';
+      const workLocation = sl.workLocation || emp.workLocation || '';
 
-      const now = new Date();
-      const timeStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: true });
-      const recordId = `REC-${Date.now()}-${Math.random().toString(36).substring(2, 7).toUpperCase()}`;
+      const punch = await this.capturePunch('IN', { emp, recordId, landowner: sl.name, workLocation, locationId });
+      if (!punch) return;
+
+      // Check again (the camera screen may have been open for a while)
+      existing = await findToday();
+      if (existing && (existing.timeIn || this.isLeave(existing))) throw new Error('Another Time IN or leave was saved for this employee meanwhile.');
+
       const currentUser = auth.getCurrentUser() || {};
-
-      const newRecord = {
+      const timeStr = this.fmtTime(punch.takenAt);
+      const record = {
         attendanceRecordId: recordId,
         employeeId: emp.employeeId,
         employeeName: emp.employeeName,
         supervisorId: emp.supervisorId || currentUser.linkedSupervisorId || '',
         supervisorName: emp.supervisorName || currentUser.name || '',
-        landownerId: (this.sessionLandowner && this.sessionLandowner.id) ? this.sessionLandowner.id : '',
-        landownerName: (this.sessionLandowner && this.sessionLandowner.name) ? this.sessionLandowner.name : '',
-        locationId: emp.locationId || '',
-        workLocation: (this.sessionLandowner && this.sessionLandowner.workLocation) ? this.sessionLandowner.workLocation : (emp.workLocation || ''),
-        attendanceDate: todayDate,
+        landownerId: sl.id || '',
+        landownerName: sl.name || '',
+        locationId,
+        workLocation,
+        attendanceDate: this.fmtLocalDate(punch.takenAt),
         timeIn: timeStr,
         timeOut: '',
         originalTimeIn: timeStr,
         originalTimeOut: '',
         adjustedBy: '',
         adjustmentReason: '',
-        actualGpsIn: this.activeGps.coords ? `${this.activeGps.coords} (±${this.activeGps.accuracy}m)` : 'GPS Unavailable',
+        actualGpsIn: geo.format(punch.pos),
         actualGpsOut: '',
-        deviceTimestamp: now.toISOString(),
+        deviceTimestamp: punch.takenAt.toISOString(),
         synchronizationDate: '',
-        syncStatus: 'PENDING',
         recordStatus: 'ACTIVE',
-        attendanceType: 'PRESENT'
+        attendanceType: 'PRESENT',
+        photoIn: '',
+        photoOut: '',
+        distanceInMeters: punch.gf.distance === null ? '' : punch.gf.distance,
+        geofenceIn: punch.geoStatus,
+        clockFlag: await this.getClockFlags(punch.takenAt),
+        photoInSkipped: punch.skipped
       };
 
-      await db.put('attendance', newRecord);
+      await db.saveAttendance(record);
+      await this.savePunchPhoto(recordId, 'IN', punch.photo);
 
-      this.showToast(`Time IN recorded for ${emp.employeeName} at ${this.sessionLandowner.name}. (Pending Sync)`, 'success');
-      this.renderAttendanceRecording(document.getElementById('view-content-root'));
-
-      // Auto sync if online
-      if (navigator.onLine) {
-        syncService.autoSync();
-      }
+      this.showToast(`Time IN ${timeStr} saved for ${emp.employeeName}${punch.photo ? ' with photo' : ''}. (Pending upload)`, 'success');
+      this.afterPunchSaved();
     } catch (err) {
       this.showToast(err.message, 'error');
+    } finally {
+      this._punchBusy = false;
     }
   }
 
-  // Record Standard Time OUT
+  // Record Time OUT (fresh GPS + geofence + watermarked photo)
   async recordTimeOut(attendanceRecordId) {
+    if (this._punchBusy) return;
+    this._punchBusy = true;
     try {
-      const record = await db.get('attendance', attendanceRecordId);
+      let record = await db.get('attendance', attendanceRecordId);
       if (!record) throw new Error('Attendance record not found');
-      if (record.timeOut) throw new Error('Time OUT already recorded for this session.');
+      if (record.timeOut) throw new Error('Time OUT already recorded for this employee.');
+      const emp = (await db.get('employees', record.employeeId)) || { employeeId: record.employeeId, employeeName: record.employeeName };
 
-      const now = new Date();
-      const timeStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: true });
+      const punch = await this.capturePunch('OUT', {
+        emp,
+        recordId: attendanceRecordId,
+        landowner: record.landownerName,
+        workLocation: record.workLocation,
+        locationId: record.locationId
+      });
+      if (!punch) return;
 
+      // Re-read: a sync may have updated the record while the camera was open
+      record = await db.get('attendance', attendanceRecordId);
+      if (record.timeOut) throw new Error('Time OUT was already saved meanwhile.');
+
+      const settings = await auth.getAppSettings();
+      const timeStr = this.fmtTime(punch.takenAt);
       record.timeOut = timeStr;
       record.originalTimeOut = timeStr;
-      record.actualGpsOut = this.activeGps.coords ? `${this.activeGps.coords} (±${this.activeGps.accuracy}m)` : 'GPS Unavailable';
-      record.syncStatus = 'PENDING'; // Ready to sync update to server
+      record.actualGpsOut = geo.format(punch.pos);
+      record.deviceTimestampOut = punch.takenAt.toISOString();
+      record.distanceOutMeters = punch.gf.distance === null ? '' : punch.gf.distance;
+      record.geofenceOut = punch.geoStatus;
+      record.photoOutSkipped = punch.skipped;
+      const flags = await this.getClockFlags(punch.takenAt);
+      if (flags) record.clockFlag = [record.clockFlag, flags].filter(Boolean).join(',');
+      const hrs = this.computeHours(record.timeIn, record.timeOut, settings);
+      record.hoursWorked = hrs.hours;
+      record.overtimeHours = hrs.overtime;
 
-      await db.put('attendance', record);
+      await db.saveAttendance(record);
+      await this.savePunchPhoto(attendanceRecordId, 'OUT', punch.photo);
 
-      this.showToast(`Time OUT recorded for ${record.employeeName} at ${timeStr}.`, 'success');
-      this.renderAttendanceRecording(document.getElementById('view-content-root'));
-
-      if (navigator.onLine) {
-        syncService.autoSync();
-      }
+      this.showToast(`Time OUT ${timeStr} saved for ${record.employeeName}${hrs.hours !== '' ? ` (${hrs.hours} h)` : ''}.`, 'success');
+      this.afterPunchSaved();
     } catch (err) {
       this.showToast(err.message, 'error');
+    } finally {
+      this._punchBusy = false;
     }
   }
 
   // Adjustment Modal for Manual Attendance Adjustments
   async openAdjustmentModal(employeeId, existingRecordId) {
     const emp = await db.get('employees', employeeId);
+    if (!emp) { this.showToast('Employee not found on this phone.', 'error'); return; }
     let record = null;
-    if (existingRecordId) {
-      record = await db.get('attendance', existingRecordId);
-    }
+    if (existingRecordId) record = await db.get('attendance', existingRecordId);
 
     const todayDate = this.todayStr();
     const allowedLnd = await this.getAllowedLandowners();
-    const curLnd = record ? (record.landownerName || '') : (this.sessionLandowner ? this.sessionLandowner.name : '');
-    const lndNames = allowedLnd.map((l) => l.landownerName);
-    if (curLnd && !lndNames.includes(curLnd)) lndNames.unshift(curLnd); // keep what the record already has
-    const lndOptions = `<option value="">-- None --</option>` + lndNames.map((n) => `<option value="${this.escape(n)}" ${n === curLnd ? 'selected' : ''}>${this.escape(n)}</option>`).join('');
-    const nowTimeStr = new Date().toTimeString().substring(0, 5); // HH:MM for time input
+    const curLndId = record ? String(record.landownerId || '') : (this.sessionLandowner ? String(this.sessionLandowner.id || '') : '');
+    const curLndName = record ? (record.landownerName || '') : (this.sessionLandowner ? this.sessionLandowner.name : '');
+    const options = allowedLnd.map((l) => ({ id: String(l.landownerId), name: l.landownerName, locationId: l.locationId || '', workLocation: l.workLocation || '' }));
+    if (curLndName && !options.some((o) => o.id === curLndId || o.name === curLndName)) {
+      options.unshift({ id: curLndId, name: curLndName, locationId: record ? record.locationId : '', workLocation: record ? record.workLocation : '' });
+    }
+    const lndOptions = `<option value="">-- None --</option>` + options.map((o, i) =>
+      `<option value="${i}" ${(o.id && o.id === curLndId) || o.name === curLndName ? 'selected' : ''}>${this.escape(o.name)}${o.workLocation ? ' (' + this.escape(o.workLocation) + ')' : ''}</option>`).join('');
 
-    const modal = document.getElementById('adjustment-modal');
     const modalBody = document.getElementById('adjustment-modal-body');
-    if (!modal || !modalBody) return;
+    if (!modalBody) return;
 
     modalBody.innerHTML = `
-      <form id="adjustment-form">
+      <form id="adjustment-form" onsubmit="return false;">
         <div style="background: var(--bg-page); padding: 12px; border-radius: var(--radius-sm); margin-bottom: 16px;">
           <div style="font-weight: 700; color: var(--text-main);">${this.escape(emp.employeeName)}</div>
           <div style="font-size: 12px; color: var(--text-muted);">ID: ${this.escape(emp.employeeId)} | Location: ${this.escape(emp.workLocation || 'None')}</div>
@@ -1794,20 +2423,20 @@ class AttendanceApp {
         <div class="form-row">
           <div class="form-group">
             <label class="form-label required">Attendance Date</label>
-            <input type="date" id="adj-date" class="form-control" value="${record ? record.attendanceDate : todayDate}" required />
+            <input type="date" id="adj-date" class="form-control" max="${todayDate}" value="${this.escape(record ? record.attendanceDate : todayDate)}" required />
           </div>
         </div>
 
         <div class="form-row">
           <div class="form-group">
             <label class="form-label">Time IN</label>
-            <input type="text" id="adj-time-in" class="form-control" placeholder="e.g. 07:30 AM" value="${record ? (record.timeIn || '') : ''}" />
-            <div class="form-helper">Format: hh:mm AM/PM</div>
+            <input type="text" id="adj-time-in" class="form-control" placeholder="e.g. 07:30 AM" value="${this.escape(record ? (record.timeIn || '') : '')}" />
+            <div class="form-helper">hh:mm AM/PM or 24h (e.g. 07:30 AM or 16:30)</div>
           </div>
           <div class="form-group">
             <label class="form-label">Time OUT</label>
-            <input type="text" id="adj-time-out" class="form-control" placeholder="e.g. 04:30 PM" value="${record ? (record.timeOut || '') : ''}" />
-            <div class="form-helper">Format: hh:mm AM/PM</div>
+            <input type="text" id="adj-time-out" class="form-control" placeholder="e.g. 04:30 PM" value="${this.escape(record ? (record.timeOut || '') : '')}" />
+            <div class="form-helper" id="adj-hours-preview">&nbsp;</div>
           </div>
         </div>
 
@@ -1819,87 +2448,112 @@ class AttendanceApp {
 
         <div class="form-group">
           <label class="form-label required">Reason for Adjustment</label>
-          <textarea id="adj-reason" class="form-control" rows="2" placeholder="Explain why the timestamp was manually adjusted (Required for audit log)" required>${record?.adjustmentReason || ''}</textarea>
+          <textarea id="adj-reason" class="form-control" rows="2" placeholder="Explain why the time was adjusted (required for the audit log)" required>${this.escape(record?.adjustmentReason || '')}</textarea>
         </div>
 
+        <div id="adj-error" class="alert-banner bad" style="display:none"></div>
         <div style="font-size: 11px; color: var(--text-muted);">
-          * Manual adjustments preserve original device timestamps and record the editor's username in the system audit logs.
+          * The original device times are kept, and your name and reason are written to the audit log.
+          Manual entries have no photo, so they are marked "Adjusted" for the admin.
         </div>
       </form>
     `;
 
-    document.getElementById('save-adjustment-btn').onclick = async () => {
-      const adjDate = document.getElementById('adj-date').value;
-      const adjTimeIn = document.getElementById('adj-time-in').value.trim();
-      const adjTimeOut = document.getElementById('adj-time-out').value.trim();
-      const adjLandowner = (document.getElementById('adj-landowner')?.value || '').trim();
-      const adjReason = document.getElementById('adj-reason').value.trim();
+    const settings = await auth.getAppSettings();
+    const preview = () => {
+      const tin = this.normalizeTime(document.getElementById('adj-time-in').value);
+      const tout = this.normalizeTime(document.getElementById('adj-time-out').value);
+      const h = this.computeHours(tin, tout, settings);
+      document.getElementById('adj-hours-preview').textContent = h.hours !== '' ? `Hours worked: ${h.hours} h${h.overtime ? ` (OT ${h.overtime} h)` : ''}` : ' ';
+    };
+    document.getElementById('adj-time-in').addEventListener('input', preview);
+    document.getElementById('adj-time-out').addEventListener('input', preview);
+    preview();
 
-      if (!adjDate) {
-        alert('Please choose an attendance date.');
-        return;
-      }
-      if (!adjReason) {
-        alert('A reason is strictly required for manual attendance adjustments.');
-        return;
-      }
+    document.getElementById('save-adjustment-btn').onclick = async () => {
+      const errBox = document.getElementById('adj-error');
+      const showErr = (m) => { errBox.textContent = m; errBox.style.display = 'block'; };
+      errBox.style.display = 'none';
+
+      const adjDate = document.getElementById('adj-date').value;
+      const rawIn = document.getElementById('adj-time-in').value.trim();
+      const rawOut = document.getElementById('adj-time-out').value.trim();
+      const adjReason = document.getElementById('adj-reason').value.trim();
+      const sel = document.getElementById('adj-landowner').value;
+      const lnd = sel === '' ? null : options[Number(sel)];
+
+      if (!adjDate) return showErr('Please choose an attendance date.');
+      if (adjDate > todayDate) return showErr('The date cannot be in the future.');
+      const adjTimeIn = rawIn ? this.normalizeTime(rawIn) : '';
+      const adjTimeOut = rawOut ? this.normalizeTime(rawOut) : '';
+      if (rawIn && !adjTimeIn) return showErr('Time IN is not valid. Use hh:mm AM/PM, e.g. 07:30 AM.');
+      if (rawOut && !adjTimeOut) return showErr('Time OUT is not valid. Use hh:mm AM/PM, e.g. 04:30 PM.');
+      if (!adjTimeIn && !(record && record.timeIn)) return showErr('Time IN is required.');
+      if (adjTimeOut && !adjTimeIn && !(record && record.timeIn)) return showErr('Enter Time IN before Time OUT.');
+      if (adjReason.length < 5) return showErr('Please write a clear reason (at least 5 characters).');
+
+      // One record per employee per day
+      const all = await db.getAll('attendance');
+      const clash = all.find((a) => String(a.employeeId) === String(emp.employeeId) && this.ymd(a.attendanceDate) === adjDate &&
+        a.recordStatus !== 'DELETED' && (!record || a.attendanceRecordId !== record.attendanceRecordId));
+      if (clash) return showErr(`${emp.employeeName} already has a ${this.isLeave(clash) ? 'leave' : 'attendance'} record on ${adjDate}. Adjust that record instead.`);
 
       const currentUser = auth.getCurrentUser() || {};
-      const now = new Date();
-      const deviceTimeStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: true });
+      const editor = currentUser.name || currentUser.username || 'Supervisor';
 
       if (record) {
-        // Adjust existing record
         if (!record.originalTimeIn && record.timeIn) record.originalTimeIn = record.timeIn;
         if (!record.originalTimeOut && record.timeOut) record.originalTimeOut = record.timeOut;
-
         record.attendanceDate = adjDate;
         if (adjTimeIn) record.timeIn = adjTimeIn;
         if (adjTimeOut) record.timeOut = adjTimeOut;
-        if (adjLandowner) record.landownerName = adjLandowner;
-        record.adjustedBy = currentUser.name || currentUser.username || 'Supervisor';
+        if (lnd) {
+          record.landownerId = lnd.id;
+          record.landownerName = lnd.name;
+          if (lnd.locationId) record.locationId = lnd.locationId;
+          if (lnd.workLocation) record.workLocation = lnd.workLocation;
+        }
+        record.adjustedBy = editor;
         record.adjustmentReason = adjReason;
-        record.syncStatus = 'PENDING';
-
-        await db.put('attendance', record);
       } else {
-        // Create new adjusted attendance entry
-        const recordId = `REC-${Date.now()}-${Math.random().toString(36).substring(2, 7).toUpperCase()}`;
-        const newRecord = {
-          attendanceRecordId: recordId,
+        const sl = this.sessionLandowner || {};
+        record = {
+          attendanceRecordId: this.newRecordId(),
           employeeId: emp.employeeId,
           employeeName: emp.employeeName,
           supervisorId: emp.supervisorId || currentUser.linkedSupervisorId || '',
           supervisorName: emp.supervisorName || currentUser.name || '',
-          landownerId: (this.sessionLandowner && this.sessionLandowner.id) ? this.sessionLandowner.id : '',
-          landownerName: adjLandowner || (this.sessionLandowner ? this.sessionLandowner.name : ''),
-          locationId: emp.locationId || '',
-          workLocation: (this.sessionLandowner && this.sessionLandowner.workLocation) ? this.sessionLandowner.workLocation : (emp.workLocation || ''),
+          landownerId: lnd ? lnd.id : (sl.id || ''),
+          landownerName: lnd ? lnd.name : (sl.name || ''),
+          locationId: (lnd && lnd.locationId) || sl.locationId || emp.locationId || '',
+          workLocation: (lnd && lnd.workLocation) || sl.workLocation || emp.workLocation || '',
           attendanceDate: adjDate,
           timeIn: adjTimeIn,
           timeOut: adjTimeOut,
-          originalTimeIn: deviceTimeStr,
+          originalTimeIn: '',
           originalTimeOut: '',
-          adjustedBy: currentUser.name || currentUser.username || 'Supervisor',
+          adjustedBy: editor,
           adjustmentReason: adjReason,
           actualGpsIn: this.activeGps.coords ? `${this.activeGps.coords} (±${this.activeGps.accuracy}m)` : 'GPS Unavailable',
           actualGpsOut: '',
-          deviceTimestamp: now.toISOString(),
+          deviceTimestamp: new Date().toISOString(),
           synchronizationDate: '',
-          syncStatus: 'PENDING',
           recordStatus: 'ACTIVE',
-          attendanceType: 'PRESENT'
+          attendanceType: 'PRESENT',
+          photoIn: '',
+          photoOut: ''
         };
-        await db.put('attendance', newRecord);
       }
+      const h = this.computeHours(record.timeIn, record.timeOut, settings);
+      record.hoursWorked = h.hours;
+      record.overtimeHours = h.overtime;
+      await db.saveAttendance(record);
 
       this.closeModal('adjustment-modal');
-      this.showToast('Attendance adjustment saved successfully.', 'success');
+      this.showToast('Attendance adjustment saved.', 'success');
       this.refreshCurrentView();
-
-      if (navigator.onLine) {
-        syncService.autoSync();
-      }
+      this.updateSyncBadge();
+      if (navigator.onLine) syncService.autoSync();
     };
 
     this.openModal('adjustment-modal');
@@ -1997,7 +2651,9 @@ class AttendanceApp {
                   ${isAdmin ? '<th>Supervisor</th>' : ''}
                   <th>Time IN</th>
                   <th>Time OUT</th>
-                  <th>Actual GPS</th>
+                  <th>Hours</th>
+                  <th>Photos</th>
+                  <th>Checks</th>
                   <th>Sync Status</th>
                   <th>Actions</th>
                 </tr>
@@ -2011,7 +2667,10 @@ class AttendanceApp {
       </div>
     `;
 
-    this.cachedHistoryData = { records, isAdmin };
+    const photos = await db.getAll('photos');
+    const photosByRecord = {};
+    photos.forEach((p) => { (photosByRecord[p.recordId] = photosByRecord[p.recordId] || {})[p.kind] = p; });
+    this.cachedHistoryData = { records, isAdmin, photosByRecord };
     this.filterHistoryTable();
   }
 
@@ -2027,7 +2686,7 @@ class AttendanceApp {
     const syncVal = document.getElementById('hist-sync-filter')?.value || '';
     const typeVal = document.getElementById('hist-type-filter')?.value || '';
 
-    const { records, isAdmin } = this.cachedHistoryData;
+    const { records, isAdmin, photosByRecord } = this.cachedHistoryData;
 
     const filtered = records.filter((r) => {
       const matchQuery = r.employeeName.toLowerCase().includes(query) ||
@@ -2044,7 +2703,7 @@ class AttendanceApp {
     if (countBadge) countBadge.textContent = `${filtered.length} Records`;
 
     if (filtered.length === 0) {
-      tbody.innerHTML = `<tr><td colspan="${isAdmin ? 12 : 11}" style="text-align: center; padding: 32px; color: var(--text-muted);">No records found matching filters.</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="${isAdmin ? 14 : 13}" style="text-align: center; padding: 32px; color: var(--text-muted);">No records found matching filters.</td></tr>`;
       return;
     }
 
@@ -2053,14 +2712,24 @@ class AttendanceApp {
         <td><small style="font-family: monospace;">${this.escape(r.attendanceRecordId)}</small></td>
         <td><strong>${this.escape(r.attendanceDate)}</strong></td>
         <td><span class="emp-id-badge">${this.escape(r.employeeId)}</span></td>
-        <td><strong>${this.escape(r.employeeName)}</strong></td>
+        <td><span class="name-with-avatar">${this.avatarHtml('EMPLOYEE', r.employeeId, r.employeeName, 28)}<strong>${this.escape(r.employeeName)}</strong></span></td>
         <td>${this.escape(r.workLocation || '-')}</td>
         <td>${this.escape(r.landownerName || '-')}</td>
         ${isAdmin ? `<td>${this.escape(r.supervisorName || '-')}</td>` : ''}
         <td>${this.isLeave(r) ? `<span class="status-pill badge-leave">On Leave${r.leaveType ? ' – ' + this.escape(r.leaveType) : ''}</span>` : `<span style="color: var(--primary); font-weight: 600;">${this.escape(r.timeIn || '-')}</span>`}</td>
         <td><span style="color: #0284c7; font-weight: 600;">${this.escape(r.timeOut || '-')}</span></td>
-        <td><small style="color: var(--text-muted);">${this.escape(r.actualGpsIn || '-')}</small></td>
-        <td><span class="status-pill badge-${(r.syncStatus || 'PENDING').toLowerCase()}">${r.syncStatus}</span></td>
+        <td>${r.hoursWorked !== undefined && r.hoursWorked !== '' ? `<strong>${this.escape(r.hoursWorked)}</strong>${Number(r.overtimeHours) > 0 ? `<small style="display:block;color:#b45309;">OT ${this.escape(r.overtimeHours)}</small>` : ''}` : '-'}</td>
+        <td>${(() => {
+          const ph = (photosByRecord || {})[r.attendanceRecordId] || {};
+          const parts = ['IN', 'OUT'].map((k) => {
+            if (ph[k] && ph[k].thumbUrl) return `<img src="${ph[k].thumbUrl}" alt="${k}" title="Time ${k} photo" onclick="app.viewPhoto('${r.attendanceRecordId}', '${k}')" />`;
+            if (r[k === 'IN' ? 'photoIn' : 'photoOut']) return `<button class="btn btn-outline" style="padding:2px 6px;font-size:10px;" onclick="app.viewPhoto('${r.attendanceRecordId}', '${k}')">${k} 📷</button>`;
+            return '';
+          }).join('');
+          return parts ? `<div class="photo-thumbs">${parts}</div>` : '<small style="color:var(--text-light)">-</small>';
+        })()}</td>
+        <td>${this.renderFlags(r) || '<small style="color:var(--text-light)">-</small>'}</td>
+        <td><span class="status-pill badge-${(r.syncStatus || 'PENDING').toLowerCase()}">${r.syncStatus}</span>${r.syncError ? `<div class="sync-error-text">${this.escape(r.syncError)}</div>` : ''}</td>
         <td>
           <button class="btn btn-outline" style="padding: 4px 8px; font-size: 11px;" onclick="app.viewRecordDetails('${r.attendanceRecordId}')">
             Details
@@ -2086,7 +2755,8 @@ class AttendanceApp {
       <div style="display: flex; flex-direction: column; gap: 12px; font-size: 13px;">
         <div style="background: var(--bg-page); padding: 12px; border-radius: var(--radius-sm);">
           <div>Record ID: <strong style="font-family: monospace;">${this.escape(rec.attendanceRecordId)}</strong></div>
-          <div>Employee: <strong>${this.escape(rec.employeeName)} (${this.escape(rec.employeeId)})</strong></div>
+          <div style="display:flex;align-items:center;gap:10px;margin:4px 0;">${this.avatarHtml('EMPLOYEE', rec.employeeId, rec.employeeName, 48, { onclick: this.getAvatar('EMPLOYEE', rec.employeeId) ? `app.openImage(app.getAvatar('EMPLOYEE', '${this.escape(rec.employeeId)}'))` : '' })}
+            <div>Employee: <strong>${this.escape(rec.employeeName)} (${this.escape(rec.employeeId)})</strong><div style="font-size:11px;color:var(--text-muted)">Registered photo – compare with the Time IN/OUT photos below</div></div></div>
           <div>Date: <strong>${this.escape(rec.attendanceDate)}</strong></div>
         </div>
 
@@ -2114,6 +2784,19 @@ class AttendanceApp {
           </div>
         </div>
 
+        ${this.isLeave(rec) ? '' : `
+        <div class="photo-pair">
+          <div class="photo-slot" id="detail-photo-IN"><span>Time IN photo: loading…</span></div>
+          <div class="photo-slot" id="detail-photo-OUT"><span>Time OUT photo: loading…</span></div>
+        </div>
+        <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 8px; font-size: 12px;">
+          <div>Hours worked: <strong>${this.escape(rec.hoursWorked !== undefined && rec.hoursWorked !== '' ? rec.hoursWorked : '-')}</strong>${Number(rec.overtimeHours) > 0 ? ` (OT ${this.escape(rec.overtimeHours)})` : ''}</div>
+          <div>Checks: ${this.renderFlags(rec) || 'None'}</div>
+          <div>Distance IN: ${rec.distanceInMeters !== undefined && rec.distanceInMeters !== '' ? this.escape(rec.distanceInMeters) + ' m' : '-'} ${this.escape(rec.geofenceIn || '')}</div>
+          <div>Distance OUT: ${rec.distanceOutMeters !== undefined && rec.distanceOutMeters !== '' ? this.escape(rec.distanceOutMeters) + ' m' : '-'} ${this.escape(rec.geofenceOut || '')}</div>
+          ${rec.clockFlag ? `<div style="grid-column: 1 / -1; color:#b91c1c;">Clock warning: ${this.escape(rec.clockFlag)}</div>` : ''}
+        </div>`}
+
         <div>Assigned Work Location: <strong>${this.escape(rec.workLocation || 'Unassigned')}</strong></div>
         <div>Assigned Landowner: <strong>${this.escape(rec.landownerName || 'Unassigned')}</strong></div>
         <div>Supervisor: <strong>${this.escape(rec.supervisorName || 'Unassigned')}</strong></div>
@@ -2130,11 +2813,58 @@ class AttendanceApp {
           <div>Device Capture Timestamp: ${this.escape(rec.deviceTimestamp || '-')}</div>
           <div>Synchronization Date: ${this.escape(rec.synchronizationDate || 'Not yet synced')}</div>
           <div>Status: <span class="status-pill badge-${(rec.syncStatus || 'PENDING').toLowerCase()}">${rec.syncStatus}</span></div>
+          ${rec.syncError ? `<div style="color:#b91c1c;">Upload problem: ${this.escape(rec.syncError)}</div>` : ''}
         </div>
       </div>
     `;
 
     this.openModal('details-modal');
+    if (!this.isLeave(rec)) {
+      ['IN', 'OUT'].forEach((k) => this.fillPhotoSlot(rec, k, document.getElementById(`detail-photo-${k}`)));
+    }
+  }
+
+  /** Finds the best available image: full local copy, server copy (online), or thumbnail. */
+  async getPhotoSrc(rec, kind, preferFull = true) {
+    const local = await db.get('photos', `${rec.attendanceRecordId}-${kind}`);
+    if (local && local.dataUrl) return { src: local.dataUrl, local };
+    const url = rec[kind === 'OUT' ? 'photoOut' : 'photoIn'];
+    if (preferFull && url && (await api.isReachable())) {
+      try {
+        const res = await api.call('GET_PHOTO', { recordId: rec.attendanceRecordId, kind });
+        return { src: res.dataUrl, url, local };
+      } catch (e) { /* fall back to thumbnail */ }
+    }
+    if (local && local.thumbUrl) return { src: local.thumbUrl, local, url };
+    return { src: '', url, local };
+  }
+
+  async fillPhotoSlot(rec, kind, el) {
+    if (!el) return;
+    const label = kind === 'OUT' ? 'Time OUT' : 'Time IN';
+    const info = await this.getPhotoSrc(rec, kind);
+    if (info.src) {
+      el.innerHTML = `<img src="${info.src}" alt="${label} photo" />
+        <div class="photo-cap">${label}${info.local && info.local.syncStatus !== 'SYNCED' ? ' • not uploaded yet' : ''}
+        ${info.url ? ` • <a href="${this.escape(info.url)}" target="_blank" rel="noopener">Drive</a>` : ''}</div>`;
+      el.querySelector('img').onclick = () => this.openImage(info.src);
+    } else if (info.url) {
+      el.innerHTML = `<div class="photo-cap">${label} photo saved in Drive</div><a class="btn btn-outline" style="font-size:11px;padding:4px 8px;" href="${this.escape(info.url)}" target="_blank" rel="noopener">Open in Drive</a><small style="padding:4px;">Connect to the internet to preview here.</small>`;
+    } else {
+      const skipped = rec[kind === 'OUT' ? 'photoOutSkipped' : 'photoInSkipped'];
+      const hasTime = kind === 'OUT' ? rec.timeOut : rec.timeIn;
+      el.innerHTML = `<span>${hasTime ? (skipped ? `${label}: photo skipped` : `No ${label} photo`) : `No ${label} yet`}</span>`;
+    }
+  }
+
+  async viewPhoto(recordId, kind) {
+    const rec = await db.get('attendance', recordId);
+    if (!rec) return;
+    this.showToast('Opening photo…', 'info');
+    const info = await this.getPhotoSrc(rec, kind);
+    if (info.src) this.openImage(info.src);
+    else if (info.url) window.open(info.url, '_blank', 'noopener');
+    else this.showToast('Photo is not available on this phone.', 'warning');
   }
 
   // Soft Delete Attendance Confirmation
@@ -2150,8 +2880,8 @@ class AttendanceApp {
       if (!rec) throw new Error('Record not found.');
 
       rec.recordStatus = 'DELETED';
-      rec.syncStatus = 'PENDING'; // Sync deletion to Sheets
-      await db.put('attendance', rec);
+      rec.deleteReason = reason.trim();
+      await db.saveAttendance(rec); // the deletion uploads on the next sync
 
       // Log audit
       const currentUser = auth.getCurrentUser() || {};
@@ -2179,60 +2909,47 @@ class AttendanceApp {
     }
   }
 
-  // Export Attendance to CSV
+  // Export Attendance to CSV (respects the current history filters)
   async exportHistoryCsv() {
-    const allAttendance = await db.getAll('attendance');
-    const validRecords = allAttendance.filter((r) => r.recordStatus !== 'DELETED');
-
+    let validRecords = (await db.getAll('attendance')).filter((r) => r.recordStatus !== 'DELETED');
+    if (!auth.isAdmin()) {
+      const sid = String(auth.getLinkedSupervisorId() || '');
+      validRecords = validRecords.filter((r) => String(r.supervisorId || '') === sid);
+    }
     if (validRecords.length === 0) {
       alert('No attendance records available to export.');
       return;
     }
+    validRecords.sort((a, b) => (a.attendanceDate > b.attendanceDate ? 1 : -1));
 
-    const headers = [
-      'Attendance Record ID', 'Employee ID', 'Employee Name', 'Supervisor ID', 'Supervisor Name',
-      'Landowner ID', 'Landowner Name', 'Location ID', 'Work Location', 'Attendance Date',
-      'Time IN', 'Time OUT', 'Original Time IN', 'Original Time OUT', 'Adjusted By',
-      'Adjustment Reason', 'Actual GPS IN', 'Actual GPS OUT', 'Device Timestamp',
-      'Synchronization Date', 'Synchronization Status',
-      'Attendance Type', 'Leave Type', 'Leave Remarks'
+    const cols = [
+      ['Attendance Record ID', 'attendanceRecordId'], ['Employee ID', 'employeeId'], ['Employee Name', 'employeeName'],
+      ['Supervisor ID', 'supervisorId'], ['Supervisor Name', 'supervisorName'], ['Landowner ID', 'landownerId'],
+      ['Landowner Name', 'landownerName'], ['Location ID', 'locationId'], ['Work Location', 'workLocation'],
+      ['Attendance Date', 'attendanceDate'], ['Time IN', 'timeIn'], ['Time OUT', 'timeOut'],
+      ['Hours Worked', 'hoursWorked'], ['Overtime Hours', 'overtimeHours'],
+      ['Original Time IN', 'originalTimeIn'], ['Original Time OUT', 'originalTimeOut'], ['Adjusted By', 'adjustedBy'],
+      ['Adjustment Reason', 'adjustmentReason'], ['Actual GPS IN', 'actualGpsIn'], ['Actual GPS OUT', 'actualGpsOut'],
+      ['Distance IN (m)', 'distanceInMeters'], ['Geofence IN', 'geofenceIn'], ['Distance OUT (m)', 'distanceOutMeters'],
+      ['Geofence OUT', 'geofenceOut'], ['Clock Flag', 'clockFlag'], ['Photo IN', 'photoIn'], ['Photo OUT', 'photoOut'],
+      ['Device Timestamp', 'deviceTimestamp'], ['Synchronization Date', 'synchronizationDate'], ['Synchronization Status', 'syncStatus'],
+      ['Attendance Type', null], ['Leave Type', 'leaveType'], ['Leave Remarks', 'leaveRemarks']
     ];
+    const rows = validRecords.map((r) => cols.map(([h, k]) => this.csvCell(k ? r[k] : (this.isLeave(r) ? 'LEAVE' : 'PRESENT'))));
+    const csvContent = '﻿' + [cols.map((c) => this.csvCell(c[0])).join(','), ...rows.map((row) => row.join(','))].join('\r\n');
+    this.downloadText(csvContent, `Attendance_Report_${this.todayStr()}.csv`);
+  }
 
-    const rows = validRecords.map((r) => [
-      `"${r.attendanceRecordId}"`,
-      `"${r.employeeId}"`,
-      `"${r.employeeName}"`,
-      `"${r.supervisorId || ''}"`,
-      `"${r.supervisorName || ''}"`,
-      `"${r.landownerId || ''}"`,
-      `"${r.landownerName || ''}"`,
-      `"${r.locationId || ''}"`,
-      `"${r.workLocation || ''}"`,
-      `"${r.attendanceDate}"`,
-      `"${r.timeIn || ''}"`,
-      `"${r.timeOut || ''}"`,
-      `"${r.originalTimeIn || ''}"`,
-      `"${r.originalTimeOut || ''}"`,
-      `"${r.adjustedBy || ''}"`,
-      `"${(r.adjustmentReason || '').replace(/"/g, '""')}"`,
-      `"${r.actualGpsIn || ''}"`,
-      `"${r.actualGpsOut || ''}"`,
-      `"${r.deviceTimestamp || ''}"`,
-      `"${r.synchronizationDate || ''}"`,
-      `"${r.syncStatus}"`,
-      `"${this.isLeave(r) ? 'LEAVE' : 'PRESENT'}"`,
-      `"${r.leaveType || ''}"`,
-      `"${(r.leaveRemarks || '').replace(/"/g, '""')}"`
-    ]);
-
-    const csvContent = '\uFEFF' + [headers.join(','), ...rows.map((row) => row.join(','))].join('\r\n');
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+  downloadText(text, filename) {
+    const blob = new Blob([text], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `Attendance_Report_${this.todayStr()}.csv`;
+    a.download = filename;
+    document.body.appendChild(a);
     a.click();
-    URL.revokeObjectURL(url);
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
 
   /* ==========================================================================
@@ -2242,6 +2959,8 @@ class AttendanceApp {
     const stats = await syncService.getSyncStats();
     const allAtt = await db.getAll('attendance');
     const pendingList = allAtt.filter((r) => r.syncStatus === 'PENDING' || r.syncStatus === 'FAILED' || r.syncStatus === 'SYNCING');
+    const failedPhotos = (await db.getAll('photos')).filter((p) => p.syncStatus === 'FAILED');
+    const outbox = await api.getOutbox();
 
     container.innerHTML = `
       <div class="metrics-grid">
@@ -2270,10 +2989,46 @@ class AttendanceApp {
         </div>
 
         <div class="metric-card">
+          <span class="metric-title">Photos Waiting</span>
+          <div class="metric-value" style="color: ${stats.failedPhotos ? 'var(--accent-red)' : '#b45309'};">${stats.pendingPhotos}</div>
+        </div>
+
+        ${auth.isAdmin() ? `
+        <div class="metric-card">
+          <span class="metric-title">Admin Changes Queued</span>
+          <div class="metric-value" style="color: ${stats.outboxFailed ? 'var(--accent-red)' : '#b45309'};">${stats.outboxCount}</div>
+        </div>` : ''}
+
+        <div class="metric-card">
           <span class="metric-title">Total Local Records</span>
           <div class="metric-value">${stats.totalRecords}</div>
         </div>
       </div>
+
+      ${outbox.length ? `
+      <div class="content-card">
+        <div class="card-header"><h3 class="card-title">Changes Waiting to Upload</h3></div>
+        <div class="card-body" style="padding:0;">
+          <div class="table-responsive"><table class="data-table">
+            <thead><tr><th>Saved</th><th>Change</th><th>Status</th><th>Action</th></tr></thead>
+            <tbody>${outbox.map((o) => `
+              <tr>
+                <td><small>${this.escape(new Date(o.createdAt).toLocaleString())}</small></td>
+                <td>${this.escape(o.label)}</td>
+                <td>${o.status === 'FAILED' ? `<span class="status-pill badge-failed">FAILED</span><div class="sync-error-text">${this.escape(o.error)}</div>` : '<span class="status-pill badge-pending">PENDING</span>'}</td>
+                <td><button class="btn btn-outline" style="padding:4px 8px;font-size:11px;" onclick="app.discardOutboxItem('${o.id}')">Discard</button></td>
+              </tr>`).join('')}
+            </tbody>
+          </table></div>
+        </div>
+      </div>` : ''}
+
+      ${failedPhotos.length ? `
+      <div class="alert-banner bad">
+        <strong>${failedPhotos.length} photo(s) could not be uploaded:</strong>
+        ${failedPhotos.slice(0, 5).map((p) => `<div>• ${this.escape(p.recordId)} (${p.kind}): ${this.escape(p.error || 'unknown error')}</div>`).join('')}
+        <div style="margin-top:6px;">Tap "Retry Failed" to try again. Photos stay on this phone until they upload.</div>
+      </div>` : ''}
 
       <!-- Sync Controls -->
       <div class="content-card">
@@ -2304,9 +3059,13 @@ class AttendanceApp {
           ` : ''}
 
           <h4 style="font-size: 14px; font-weight: 700; margin-bottom: 10px;">Queue of Pending & Failed Records</h4>
-          ${pendingList.length === 0 ? `
+          ${pendingList.length === 0 && stats.pendingPhotos === 0 ? `
             <div style="text-align: center; padding: 32px; color: var(--text-muted); background: var(--bg-page); border-radius: 8px;">
               🎉 All records are successfully synchronized with Google Sheets!
+            </div>
+          ` : pendingList.length === 0 ? `
+            <div style="text-align: center; padding: 20px; color: var(--text-muted); background: var(--bg-page); border-radius: 8px;">
+              All records are uploaded. ${stats.pendingPhotos} photo(s) are still waiting.
             </div>
           ` : `
             <div class="table-responsive">
@@ -2333,7 +3092,7 @@ class AttendanceApp {
                       <td><strong>${this.escape(r.employeeName)}</strong></td>
                       <td>${this.escape(r.timeIn || '-')}</td>
                       <td>${this.escape(r.timeOut || '-')}</td>
-                      <td><span class="status-pill badge-${r.syncStatus.toLowerCase()}">${r.syncStatus}</span></td>
+                      <td><span class="status-pill badge-${r.syncStatus.toLowerCase()}">${r.syncStatus}</span>${r.syncError ? `<div class="sync-error-text">${this.escape(r.syncError)}</div>` : ''}</td>
                     </tr>
                   `).join('')}
                 </tbody>
@@ -2343,6 +3102,13 @@ class AttendanceApp {
         </div>
       </div>
     `;
+  }
+
+  async discardOutboxItem(id) {
+    if (!confirm('Discard this change? It will NOT be saved to Google Sheets.')) return;
+    await db.delete('outbox', id);
+    this.showToast('Change discarded. Pull latest data to refresh the lists.', 'info');
+    this.renderSyncView(document.getElementById('view-content-root'));
   }
 
   toggleSyncCheckbox(id, isChecked) {
@@ -2372,7 +3138,7 @@ class AttendanceApp {
 
   async triggerRetryFailed() {
     try {
-      this.showToast('Retrying failed records...', 'info');
+      this.showToast('Retrying failed items...', 'info');
       await syncService.retryFailed();
       this.renderSyncView(document.getElementById('view-content-root'));
     } catch (err) {
@@ -2397,8 +3163,8 @@ class AttendanceApp {
 
   async pullFreshData() {
     try {
-      this.showToast('Pulling latest metadata from Google Sheets...', 'info');
-      await syncService.pullRemoteData();
+      this.showToast('Pulling latest data from Google Sheets...', 'info');
+      await syncService.pullRemoteData(true);
       this.showToast('Local database updated from Google Sheets.', 'success');
       this.renderSyncView(document.getElementById('view-content-root'));
     } catch (err) {
@@ -2453,7 +3219,7 @@ class AttendanceApp {
                 <label class="form-label required">Assigned Supervisor</label>
                 <select id="emp-sup-select" class="form-control" required>
                   <option value="">Select Supervisor</option>
-                  ${supervisors.map((s) => `<option value="${s.supervisorId}" data-name="${this.escape(s.supervisorName)}">${this.escape(s.supervisorName)} (${s.supervisorId})</option>`).join('')}
+                  ${supervisors.filter((s) => s.accountStatus !== 'Inactive').map((s) => `<option value="${this.escape(s.supervisorId)}" data-name="${this.escape(s.supervisorName)}">${this.escape(s.supervisorName)} (${this.escape(s.supervisorId)})</option>`).join('')}
                 </select>
               </div>
 
@@ -2461,8 +3227,19 @@ class AttendanceApp {
                 <label class="form-label required">Assigned Work Location</label>
                 <select id="emp-loc-select" class="form-control" required>
                   <option value="">Select Location</option>
-                  ${locations.map((loc) => `<option value="${loc.locationId}" data-name="${this.escape(loc.workLocationName)}">${this.escape(loc.workLocationName)}</option>`).join('')}
+                  ${locations.map((loc) => `<option value="${this.escape(loc.locationId)}" data-name="${this.escape(loc.workLocationName)}">${this.escape(loc.workLocationName)}</option>`).join('')}
                 </select>
+              </div>
+            </div>
+
+            <div class="form-group">
+              <label class="form-label required">Employee Photo <small style="font-weight:normal;color:var(--text-muted)">(required for new employees – used to check the face on Time IN/OUT photos)</small></label>
+              <div class="emp-photo-row">
+                <div id="emp-photo-preview"></div>
+                <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                  <button type="button" id="emp-photo-btn" class="btn btn-outline" onclick="app.captureEmployeePhoto()">📷 Take or Upload Photo</button>
+                  <button type="button" id="emp-photo-remove" class="btn btn-outline" style="display:none" onclick="app.removeEmployeePhoto()">Remove</button>
+                </div>
               </div>
             </div>
 
@@ -2493,12 +3270,14 @@ class AttendanceApp {
       <div class="content-card">
         <div class="card-header">
           <h3 class="card-title">Enrolled Employees Directory (${employees.length})</h3>
+          ${employees.filter((e) => !this.getAvatar('EMPLOYEE', e.employeeId)).length ? `<span class="flag-pill flag-warn">${employees.filter((e) => !this.getAvatar('EMPLOYEE', e.employeeId)).length} without photo – tap the circle to add</span>` : ''}
         </div>
         <div class="card-body" style="padding: 0;">
           <div class="table-responsive">
             <table class="data-table">
               <thead>
                 <tr>
+                  <th>Photo</th>
                   <th>Employee ID</th>
                   <th>Full Name</th>
                   <th>Position</th>
@@ -2510,8 +3289,9 @@ class AttendanceApp {
                 </tr>
               </thead>
               <tbody>
-                ${employees.length === 0 ? `<tr><td colspan="8" style="text-align: center; padding: 24px;">No employees enrolled yet.</td></tr>` : employees.map((emp) => `
+                ${employees.length === 0 ? `<tr><td colspan="9" style="text-align: center; padding: 24px;">No employees enrolled yet.</td></tr>` : employees.map((emp) => `
                   <tr>
+                    <td>${this.employeeAvatar(emp, 40, { markMissing: true, onclick: `app.openProfilePhotoModal('EMPLOYEE', '${this.escape(emp.employeeId)}', '${this.escape(emp.employeeName).replace(/&#39;/g, '')}')` })}</td>
                     <td><span class="emp-id-badge">${this.escape(emp.employeeId)}</span></td>
                     <td><strong>${this.escape(emp.employeeName)}</strong></td>
                     <td>${this.escape(emp.position || '-')}</td>
@@ -2535,6 +3315,25 @@ class AttendanceApp {
       e.preventDefault();
       await this.saveEmployeeHandler();
     });
+    this.pendingEmployeePhoto = null;
+    this.renderEmployeePhotoPreview();
+  }
+
+  /** Saves admin data online, or queues it when offline. Returns true when saved/queued. */
+  async saveMasterAndReport(action, data, label, successMsg) {
+    try {
+      const res = await api.saveMaster(action, data, label);
+      if (res.queued) {
+        this.showToast(`${label}: saved on this phone only. It will upload to Google Sheets when you are online.`, 'warning');
+        this.updateSyncBadge();
+      } else {
+        this.showToast(successMsg, 'success');
+      }
+      return true;
+    } catch (err) {
+      this.showToast(`Not saved: ${err.message}`, 'error');
+      return false;
+    }
   }
 
   async saveEmployeeHandler() {
@@ -2547,63 +3346,47 @@ class AttendanceApp {
     const status = document.getElementById('emp-status-select').value;
     const dateEnrolled = document.getElementById('emp-date-enrolled').value;
 
-    const supervisorId = supSelect.value;
-    const supervisorName = supSelect.options[supSelect.selectedIndex]?.getAttribute('data-name') || '';
-
-    const locationId = locSelect.value;
-    const workLocation = locSelect.options[locSelect.selectedIndex]?.getAttribute('data-name') || '';
+    if (!/^[A-Za-z0-9._-]{1,30}$/.test(empId)) {
+      alert('Employee ID can only contain letters, numbers, dot, dash or underscore (max 30).');
+      return;
+    }
 
     const isEdit = !!this.currentEditEmployee;
-
-    // Check duplicate Employee ID if adding new
-    if (!isEdit) {
-      const existing = await db.get('employees', empId);
-      if (existing) {
-        alert(`Employee ID "${empId}" already exists. Duplicate IDs are not allowed!`);
-        return;
-      }
+    const photo = this.pendingEmployeePhoto;
+    if (!isEdit && (!photo || photo === 'REMOVE')) {
+      alert('Please take or upload the employee\'s photo before enrolling.');
+      return;
+    }
+    if (!isEdit && (await db.get('employees', empId))) {
+      alert(`Employee ID "${empId}" already exists. Duplicate IDs are not allowed!`);
+      return;
     }
 
     const employeeObj = {
       employeeId: empId,
       employeeName: empName,
-      position: position,
+      position,
       department: dept,
-      supervisorId: supervisorId,
-      supervisorName: supervisorName,
+      supervisorId: supSelect.value,
+      supervisorName: supSelect.options[supSelect.selectedIndex]?.getAttribute('data-name') || '',
       landownerId: '',
       landownerName: '',
-      locationId: locationId,
-      workLocation: workLocation,
+      locationId: locSelect.value,
+      workLocation: locSelect.options[locSelect.selectedIndex]?.getAttribute('data-name') || '',
       employmentStatus: status,
-      dateEnrolled: dateEnrolled
+      dateEnrolled
     };
 
-    // Save locally to IndexedDB
+    const btn = document.getElementById('emp-save-btn');
+    btn.disabled = true;
+    const ok = await this.saveMasterAndReport('SAVE_EMPLOYEE', { employee: employeeObj, isEdit },
+      `${isEdit ? 'Update' : 'Enroll'} employee ${empName} (${empId})`, `Employee ${empName} saved to Google Sheets.`);
+    btn.disabled = false;
+    if (!ok) return;
+
     await db.put('employees', employeeObj);
-
-    // If online, save directly to Google Sheets API
-    const apiUrl = await db.getSetting('apiUrl', '');
-    if (navigator.onLine && apiUrl) {
-      try {
-        const currentUser = auth.getCurrentUser() || {};
-        await fetch(apiUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-          body: JSON.stringify({
-            action: 'SAVE_EMPLOYEE',
-            employee: employeeObj,
-            isEdit: isEdit,
-            userId: currentUser.userId || 'ADMIN',
-            userRole: currentUser.role || 'Admin'
-          })
-        });
-      } catch (e) {
-        console.warn('[Employee] Server save will sync later:', e);
-      }
-    }
-
-    this.showToast(`Employee ${empName} saved successfully!`, 'success');
+    if (photo) await this.saveProfilePhoto('EMPLOYEE', empId, photo === 'REMOVE' ? '' : photo, `Photo of ${empName}`);
+    this.pendingEmployeePhoto = null;
     this.cancelEmployeeEdit();
     this.renderEmployeesView(document.getElementById('view-content-root'));
   }
@@ -2626,6 +3409,8 @@ class AttendanceApp {
 
     document.getElementById('emp-cancel-edit-btn').style.display = 'inline-flex';
     document.getElementById('emp-save-btn').textContent = 'Update & Reassign Employee';
+    this.pendingEmployeePhoto = null;
+    this.renderEmployeePhotoPreview();
 
     window.scrollTo({ top: 0, behavior: 'smooth' });
   }
@@ -2640,6 +3425,8 @@ class AttendanceApp {
     if (cancelBtn) cancelBtn.style.display = 'none';
     const saveBtn = document.getElementById('emp-save-btn');
     if (saveBtn) saveBtn.textContent = 'Enroll Employee';
+    this.pendingEmployeePhoto = null;
+    this.renderEmployeePhotoPreview();
   }
 
   /* ==========================================================================
@@ -2647,11 +3434,12 @@ class AttendanceApp {
      ========================================================================== */
   async renderSupervisorsView(container) {
     const supervisors = await db.getAll('supervisors');
+    this.editingSupervisorId = null;
 
     container.innerHTML = `
       <div class="content-card">
         <div class="card-header">
-          <h3 class="card-title">Supervisor Enrollment</h3>
+          <h3 class="card-title" id="sup-form-title">Supervisor Enrollment</h3>
         </div>
         <div class="card-body">
           <form id="enroll-sup-form">
@@ -2666,26 +3454,28 @@ class AttendanceApp {
               </div>
               <div class="form-group">
                 <label class="form-label required">Username (Login Account)</label>
-                <input type="text" id="sup-user-input" class="form-control" placeholder="e.g. jdelacruz" required />
+                <input type="text" id="sup-user-input" class="form-control" placeholder="e.g. jdelacruz" required autocomplete="off" />
               </div>
             </div>
 
             <div class="form-row">
               <div class="form-group">
-                <label class="form-label required">Password</label>
-                <input type="password" id="sup-pass-input" class="form-control" placeholder="••••••••" required />
+                <label class="form-label" id="sup-pass-label">Password (min. 8 characters)</label>
+                <input type="password" id="sup-pass-input" class="form-control" placeholder="••••••••" autocomplete="new-password" />
+                <div class="form-helper" id="sup-pass-help">The supervisor must change it at first login.</div>
               </div>
               <div class="form-group">
                 <label class="form-label required">Account Status</label>
                 <select id="sup-status-select" class="form-control">
                   <option value="Active">Active</option>
-                  <option value="Inactive">Inactive</option>
+                  <option value="Inactive">Inactive (cannot log in, even offline)</option>
                 </select>
               </div>
             </div>
 
-            <div style="text-align: right; margin-top: 10px;">
-              <button type="submit" class="btn btn-primary">Enroll Supervisor</button>
+            <div style="display:flex; gap:10px; justify-content:flex-end; margin-top: 10px;">
+              <button type="button" id="sup-cancel-btn" class="btn btn-outline" style="display:none" onclick="app.renderSupervisorsView(document.getElementById('view-content-root'))">Cancel Edit</button>
+              <button type="submit" id="sup-save-btn" class="btn btn-primary">Enroll Supervisor</button>
             </div>
           </form>
         </div>
@@ -2700,19 +3490,23 @@ class AttendanceApp {
             <table class="data-table">
               <thead>
                 <tr>
+                  <th>Photo</th>
                   <th>Supervisor ID</th>
                   <th>Full Name</th>
                   <th>Username</th>
                   <th>Status</th>
+                  <th>Action</th>
                 </tr>
               </thead>
               <tbody>
                 ${supervisors.map((s) => `
                   <tr>
+                    <td>${(() => { const k = this.supervisorAvatarKey(s.supervisorId); return this.avatarHtml(k ? k.type : '', k ? k.id : '', s.supervisorName, 40, k ? { onclick: `app.openProfilePhotoModal('USER', '${this.escape(k.id)}', '${this.escape(s.supervisorName).replace(/&#39;/g, '')}')` } : {}); })()}</td>
                     <td><span class="emp-id-badge">${this.escape(s.supervisorId)}</span></td>
                     <td><strong>${this.escape(s.supervisorName)}</strong></td>
                     <td>${this.escape(s.username)}</td>
-                    <td><span class="status-pill ${s.accountStatus === 'Active' ? 'status-online' : 'status-offline'}">${s.accountStatus}</span></td>
+                    <td><span class="status-pill ${s.accountStatus === 'Active' ? 'status-online' : 'status-offline'}">${this.escape(s.accountStatus)}</span></td>
+                    <td><button class="btn btn-outline" style="padding: 4px 8px; font-size: 11px;" data-sup="${this.escape(s.supervisorId)}">Edit</button></td>
                   </tr>
                 `).join('')}
               </tbody>
@@ -2722,59 +3516,51 @@ class AttendanceApp {
       </div>
     `;
 
+    container.querySelectorAll('button[data-sup]').forEach((b) => b.addEventListener('click', () => {
+      const s = supervisors.find((x) => String(x.supervisorId) === b.dataset.sup);
+      if (!s) return;
+      this.editingSupervisorId = s.supervisorId;
+      document.getElementById('sup-id-input').value = s.supervisorId;
+      document.getElementById('sup-id-input').disabled = true;
+      document.getElementById('sup-name-input').value = s.supervisorName || '';
+      document.getElementById('sup-user-input').value = s.username || '';
+      document.getElementById('sup-status-select').value = s.accountStatus || 'Active';
+      document.getElementById('sup-pass-input').value = '';
+      document.getElementById('sup-pass-help').textContent = 'Leave blank to keep the current password. A new password must be changed at next login.';
+      document.getElementById('sup-form-title').textContent = `Edit Supervisor ${s.supervisorId}`;
+      document.getElementById('sup-save-btn').textContent = 'Update Supervisor';
+      document.getElementById('sup-cancel-btn').style.display = 'inline-flex';
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }));
+
     document.getElementById('enroll-sup-form').addEventListener('submit', async (e) => {
       e.preventDefault();
-      const supId = document.getElementById('sup-id-input').value.trim();
+      const isEdit = !!this.editingSupervisorId;
+      const supId = isEdit ? this.editingSupervisorId : document.getElementById('sup-id-input').value.trim();
       const supName = document.getElementById('sup-name-input').value.trim();
       const username = document.getElementById('sup-user-input').value.trim();
       const pass = document.getElementById('sup-pass-input').value;
       const status = document.getElementById('sup-status-select').value;
 
-      const passwordHash = await auth.hashPassword(pass);
+      if (!isEdit && (await db.get('supervisors', supId))) { alert(`Supervisor ID "${supId}" already exists. Use Edit instead.`); return; }
+      if (!/^[A-Za-z0-9._-]{3,30}$/.test(username)) { alert('Username: 3-30 letters, numbers, dot, dash or underscore.'); return; }
+      if (!isEdit && !pass) { alert('Please set a password for the new supervisor.'); return; }
+      if (pass && pass.length < 8) { alert('Password must be at least 8 characters.'); return; }
 
       const supervisorObj = {
         supervisorId: supId,
         supervisorName: supName,
-        username: username,
-        passwordHash: passwordHash,
-        accountStatus: status
-      };
-
-      await db.put('supervisors', supervisorObj);
-
-      // Sync account to users store
-      const userObj = {
-        userId: `USR-${supId}`,
-        username: username,
-        passwordHash: passwordHash,
-        role: 'Supervisor',
-        linkedSupervisorId: supId,
-        name: supName,
+        username,
         accountStatus: status,
-        lastLogin: ''
+        passwordHash: pass ? await auth.hashPassword(pass) : ''
       };
-      await db.put('users', userObj);
 
-      const apiUrl = await db.getSetting('apiUrl', '');
-      if (navigator.onLine && apiUrl) {
-        try {
-          const currentUser = auth.getCurrentUser() || {};
-          await fetch(apiUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-            body: JSON.stringify({
-              action: 'SAVE_SUPERVISOR',
-              supervisor: supervisorObj,
-              userId: currentUser.userId || 'ADMIN',
-              userRole: currentUser.role || 'Admin'
-            })
-          });
-        } catch (err) {
-          console.warn('[Supervisor] Server sync pending:', err);
-        }
-      }
+      const ok = await this.saveMasterAndReport('SAVE_SUPERVISOR', { supervisor: supervisorObj },
+        `${isEdit ? 'Update' : 'Enroll'} supervisor ${supName}`, `Supervisor ${supName} saved.`);
+      if (!ok) return;
 
-      this.showToast(`Supervisor ${supName} enrolled!`, 'success');
+      delete supervisorObj.passwordHash;
+      await db.put('supervisors', supervisorObj);
       this.renderSupervisorsView(document.getElementById('view-content-root'));
     });
   }
@@ -2788,11 +3574,12 @@ class AttendanceApp {
       db.getAll('locations'),
       db.getAll('supervisors')
     ]);
+    this.editingLandownerId = null;
 
     container.innerHTML = `
       <div class="content-card">
         <div class="card-header">
-          <h3 class="card-title">Landowner Enrollment</h3>
+          <h3 class="card-title" id="lnd-form-title">Landowner Enrollment</h3>
         </div>
         <div class="card-body">
           <form id="enroll-lnd-form">
@@ -2809,7 +3596,7 @@ class AttendanceApp {
                 <label class="form-label required">Assigned Work Location</label>
                 <select id="lnd-loc-select" class="form-control" required>
                   <option value="">Select Location</option>
-                  ${locations.map((loc) => `<option value="${loc.locationId}" data-name="${this.escape(loc.workLocationName)}">${this.escape(loc.workLocationName)}</option>`).join('')}
+                  ${locations.map((loc) => `<option value="${this.escape(loc.locationId)}" data-name="${this.escape(loc.workLocationName)}">${this.escape(loc.workLocationName)}</option>`).join('')}
                 </select>
               </div>
             </div>
@@ -2819,7 +3606,7 @@ class AttendanceApp {
                 <label class="form-label">Supervisor <small style="font-weight: normal; color: var(--text-muted);">(automatic, from the Work Location)</small></label>
                 <select id="lnd-sup-select" class="form-control" disabled>
                   <option value="">Select a Work Location first</option>
-                  ${supervisors.map((s) => `<option value="${s.supervisorId}">${this.escape(s.supervisorName)}</option>`).join('')}
+                  ${supervisors.map((s) => `<option value="${this.escape(s.supervisorId)}">${this.escape(s.supervisorName)}</option>`).join('')}
                 </select>
               </div>
               <div class="form-group">
@@ -2831,8 +3618,9 @@ class AttendanceApp {
               </div>
             </div>
 
-            <div style="text-align: right; margin-top: 10px;">
-              <button type="submit" class="btn btn-primary">Enroll Landowner</button>
+            <div style="display:flex; gap:10px; justify-content:flex-end; margin-top: 10px;">
+              <button type="button" id="lnd-cancel-btn" class="btn btn-outline" style="display:none" onclick="app.renderLandownersView(document.getElementById('view-content-root'))">Cancel Edit</button>
+              <button type="submit" id="lnd-save-btn" class="btn btn-primary">Enroll Landowner</button>
             </div>
           </form>
         </div>
@@ -2852,23 +3640,24 @@ class AttendanceApp {
                   <th>Assigned Location</th>
                   <th>Supervisor (via location)</th>
                   <th>Status</th>
+                  <th>Action</th>
                 </tr>
               </thead>
               <tbody>
-                ${landowners.map((l) => `
+                ${landowners.map((l) => {
+                  const loc = locations.find((x) => String(x.locationId) === String(l.locationId)) ||
+                              locations.find((x) => x.landownerId && String(x.landownerId) === String(l.landownerId));
+                  const sup = loc ? supervisors.find((x) => String(x.supervisorId) === String(loc.supervisorId)) : null;
+                  return `
                   <tr>
                     <td><span class="emp-id-badge">${this.escape(l.landownerId)}</span></td>
                     <td><strong>${this.escape(l.landownerName)}</strong></td>
-                    ${(() => {
-                      const loc = locations.find((x) => String(x.locationId) === String(l.locationId)) ||
-                                  locations.find((x) => x.landownerId && String(x.landownerId) === String(l.landownerId));
-                      const sup = loc ? supervisors.find((x) => String(x.supervisorId) === String(loc.supervisorId)) : null;
-                      return `<td>${this.escape((loc && loc.workLocationName) || l.workLocation || '-')}</td>
-                    <td>${sup ? this.escape(sup.supervisorName) : '<span class="status-pill badge-leave">No supervisor yet</span>'}</td>`;
-                    })()}
-                    <td><span class="status-pill ${l.status === 'Active' ? 'status-online' : 'status-offline'}">${l.status}</span></td>
-                  </tr>
-                `).join('')}
+                    <td>${this.escape((loc && loc.workLocationName) || l.workLocation || '-')}</td>
+                    <td>${sup ? this.escape(sup.supervisorName) : '<span class="status-pill badge-leave">No supervisor yet</span>'}</td>
+                    <td><span class="status-pill ${l.status === 'Active' ? 'status-online' : 'status-offline'}">${this.escape(l.status)}</span></td>
+                    <td><button class="btn btn-outline" style="padding: 4px 8px; font-size: 11px;" data-lnd="${this.escape(l.landownerId)}">Edit</button></td>
+                  </tr>`;
+                }).join('')}
               </tbody>
             </table>
           </div>
@@ -2876,74 +3665,80 @@ class AttendanceApp {
       </div>
     `;
 
-    // Show which supervisor the chosen Work Location belongs to
+    const showSup = (locId) => {
+      const loc = locations.find((x) => String(x.locationId) === String(locId));
+      document.getElementById('lnd-sup-select').value = loc && loc.supervisorId ? loc.supervisorId : '';
+      return loc;
+    };
     document.getElementById('lnd-loc-select').addEventListener('change', (ev) => {
-      const loc = locations.find((x) => String(x.locationId) === String(ev.target.value));
-      const supSel = document.getElementById('lnd-sup-select');
-      supSel.value = loc && loc.supervisorId ? loc.supervisorId : '';
+      const loc = showSup(ev.target.value);
       if (loc && !loc.supervisorId) this.showToast('This location has no supervisor yet. Assign one under Work Locations so the supervisor can see this landowner.', 'warning');
     });
 
+    container.querySelectorAll('button[data-lnd]').forEach((b) => b.addEventListener('click', () => {
+      const l = landowners.find((x) => String(x.landownerId) === b.dataset.lnd);
+      if (!l) return;
+      this.editingLandownerId = l.landownerId;
+      document.getElementById('lnd-id-input').value = l.landownerId;
+      document.getElementById('lnd-id-input').disabled = true;
+      document.getElementById('lnd-name-input').value = l.landownerName || '';
+      document.getElementById('lnd-loc-select').value = l.locationId || '';
+      document.getElementById('lnd-status-select').value = l.status || 'Active';
+      showSup(l.locationId);
+      document.getElementById('lnd-form-title').textContent = `Edit Landowner ${l.landownerId}`;
+      document.getElementById('lnd-save-btn').textContent = 'Update Landowner';
+      document.getElementById('lnd-cancel-btn').style.display = 'inline-flex';
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }));
+
     document.getElementById('enroll-lnd-form').addEventListener('submit', async (e) => {
       e.preventDefault();
-      const lndId = document.getElementById('lnd-id-input').value.trim();
+      const isEdit = !!this.editingLandownerId;
+      const lndId = isEdit ? this.editingLandownerId : document.getElementById('lnd-id-input').value.trim();
+      if (!isEdit && landowners.some((x) => String(x.landownerId).toLowerCase() === lndId.toLowerCase())) {
+        alert(`Landowner ID "${lndId}" already exists. Use Edit instead.`);
+        return;
+      }
       const lndName = document.getElementById('lnd-name-input').value.trim();
       const locSelect = document.getElementById('lnd-loc-select');
       const locationId = locSelect.value;
       const workLocation = locSelect.options[locSelect.selectedIndex]?.getAttribute('data-name') || '';
       const chosenLoc = locations.find((x) => String(x.locationId) === String(locationId)) || {};
-      const supervisorId = chosenLoc.supervisorId || '';
-      const status = document.getElementById('lnd-status-select').value;
 
       const landownerObj = {
         landownerId: lndId,
         landownerName: lndName,
-        locationId: locationId,
-        workLocation: workLocation,
-        supervisorId: supervisorId,
-        status: status
+        locationId,
+        workLocation,
+        supervisorId: chosenLoc.supervisorId || '',
+        status: document.getElementById('lnd-status-select').value
       };
 
+      const ok = await this.saveMasterAndReport('SAVE_LANDOWNER', { landowner: landownerObj },
+        `${isEdit ? 'Update' : 'Enroll'} landowner ${lndName}`, `Landowner ${lndName} saved.`);
+      if (!ok) return;
       await db.put('landowners', landownerObj);
-
-      const apiUrl = await db.getSetting('apiUrl', '');
-      if (navigator.onLine && apiUrl) {
-        try {
-          const currentUser = auth.getCurrentUser() || {};
-          await fetch(apiUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-            body: JSON.stringify({
-              action: 'SAVE_LANDOWNER',
-              landowner: landownerObj,
-              userId: currentUser.userId || 'ADMIN',
-              userRole: currentUser.role || 'Admin'
-            })
-          });
-        } catch (err) {
-          console.warn('[Landowner] Server sync pending:', err);
-        }
-      }
-
-      this.showToast(`Landowner ${lndName} saved!`, 'success');
       this.renderLandownersView(document.getElementById('view-content-root'));
     });
   }
 
   /* ==========================================================================
-     ADMIN MODULE 4: WORK LOCATION ENROLLMENT
+     ADMIN MODULE 4: WORK LOCATION ENROLLMENT (with map coordinates for geofencing)
      ========================================================================== */
   async renderLocationsView(container) {
-    const [locations, landowners, supervisors] = await Promise.all([
+    const [locations, landowners, supervisors, settings] = await Promise.all([
       db.getAll('locations'),
       db.getAll('landowners'),
-      db.getAll('supervisors')
+      db.getAll('supervisors'),
+      auth.getAppSettings()
     ]);
+    this.editingLocationId = null;
+    const supName = (id) => (supervisors.find((s) => String(s.supervisorId) === String(id)) || {}).supervisorName || id || '-';
 
     container.innerHTML = `
       <div class="content-card">
         <div class="card-header">
-          <h3 class="card-title">Work Location Enrollment</h3>
+          <h3 class="card-title" id="loc-form-title">Work Location Enrollment</h3>
         </div>
         <div class="card-body">
           <form id="enroll-loc-form">
@@ -2954,11 +3749,11 @@ class AttendanceApp {
               </div>
               <div class="form-group">
                 <label class="form-label required">Work Location Name</label>
-                <input type="text" id="loc-name-input" class="form-control" placeholder="e.g. North Plantation Block A" required />
+                <input type="text" id="loc-name-input" class="form-control" placeholder="e.g. Farm 4 Block 1" required />
               </div>
               <div class="form-group">
                 <label class="form-label">Description</label>
-                <input type="text" id="loc-desc-input" class="form-control" placeholder="e.g. Citrus Groves section" />
+                <input type="text" id="loc-desc-input" class="form-control" placeholder="e.g. Coconut block near the river" />
               </div>
             </div>
 
@@ -2967,14 +3762,14 @@ class AttendanceApp {
                 <label class="form-label">Landowner Name</label>
                 <select id="loc-lnd-select" class="form-control">
                   <option value="">Select Landowner (Optional)</option>
-                  ${landowners.map((l) => `<option value="${l.landownerId}" data-name="${this.escape(l.landownerName)}">${this.escape(l.landownerName)}</option>`).join('')}
+                  ${landowners.map((l) => `<option value="${this.escape(l.landownerId)}" data-name="${this.escape(l.landownerName)}">${this.escape(l.landownerName)}</option>`).join('')}
                 </select>
               </div>
               <div class="form-group">
                 <label class="form-label">Assigned Supervisor</label>
                 <select id="loc-sup-select" class="form-control">
                   <option value="">Select Supervisor (Optional)</option>
-                  ${supervisors.map((s) => `<option value="${s.supervisorId}">${this.escape(s.supervisorName)}</option>`).join('')}
+                  ${supervisors.map((s) => `<option value="${this.escape(s.supervisorId)}">${this.escape(s.supervisorName)}</option>`).join('')}
                 </select>
               </div>
               <div class="form-group">
@@ -2986,8 +3781,31 @@ class AttendanceApp {
               </div>
             </div>
 
-            <div style="text-align: right; margin-top: 10px;">
-              <button type="submit" class="btn btn-primary">Enroll Location</button>
+            <div style="background: var(--primary-subtle); border: 1px solid var(--primary-border); border-radius: 8px; padding: 12px; margin-bottom: 12px;">
+              <div style="font-weight:700; font-size: 13px; margin-bottom: 6px;">📍 Geofence (center of the work area)</div>
+              <div class="form-row">
+                <div class="form-group">
+                  <label class="form-label">Latitude</label>
+                  <input type="number" step="any" id="loc-lat-input" class="form-control" placeholder="e.g. 7.123456" />
+                </div>
+                <div class="form-group">
+                  <label class="form-label">Longitude</label>
+                  <input type="number" step="any" id="loc-lng-input" class="form-control" placeholder="e.g. 125.123456" />
+                </div>
+                <div class="form-group">
+                  <label class="form-label">Allowed Radius (meters)</label>
+                  <input type="number" min="10" max="20000" id="loc-radius-input" class="form-control" placeholder="Default ${this.escape(settings.defaultRadiusMeters)}" />
+                </div>
+              </div>
+              <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+                <button type="button" class="btn btn-outline" id="loc-gps-btn">📍 Use my current GPS</button>
+                <span class="form-helper" id="loc-gps-status">Stand in the middle of the block and tap the button, or paste coordinates from Google Maps.</span>
+              </div>
+            </div>
+
+            <div style="display:flex; gap:10px; justify-content:flex-end; margin-top: 10px;">
+              <button type="button" id="loc-cancel-btn" class="btn btn-outline" style="display:none" onclick="app.renderLocationsView(document.getElementById('view-content-root'))">Cancel Edit</button>
+              <button type="submit" id="loc-save-btn" class="btn btn-primary">Enroll Location</button>
             </div>
           </form>
         </div>
@@ -3004,21 +3822,25 @@ class AttendanceApp {
                 <tr>
                   <th>Location ID</th>
                   <th>Location Name</th>
-                  <th>Description</th>
                   <th>Landowner</th>
-                  <th>Supervisor ID</th>
+                  <th>Supervisor</th>
+                  <th>Geofence</th>
                   <th>Status</th>
+                  <th>Action</th>
                 </tr>
               </thead>
               <tbody>
                 ${locations.map((loc) => `
                   <tr>
                     <td><span class="emp-id-badge">${this.escape(loc.locationId)}</span></td>
-                    <td><strong>${this.escape(loc.workLocationName)}</strong></td>
-                    <td>${this.escape(loc.description || '-')}</td>
+                    <td><strong>${this.escape(loc.workLocationName)}</strong><small style="display:block;color:var(--text-muted)">${this.escape(loc.description || '')}</small></td>
                     <td>${this.escape(loc.landownerName || '-')}</td>
-                    <td>${this.escape(loc.supervisorId || '-')}</td>
-                    <td><span class="status-pill ${loc.status === 'Active' ? 'status-online' : 'status-offline'}">${loc.status}</span></td>
+                    <td>${this.escape(supName(loc.supervisorId))}</td>
+                    <td>${loc.latitude !== '' && loc.latitude !== undefined && loc.latitude !== null
+                      ? `<a href="https://maps.google.com/?q=${encodeURIComponent(loc.latitude + ',' + loc.longitude)}" target="_blank" rel="noopener">${Number(loc.latitude).toFixed(5)}, ${Number(loc.longitude).toFixed(5)}</a><small style="display:block">± ${this.escape(loc.radiusMeters || settings.defaultRadiusMeters)} m</small>`
+                      : '<span class="flag-pill flag-warn">Not set</span>'}</td>
+                    <td><span class="status-pill ${loc.status === 'Active' ? 'status-online' : 'status-offline'}">${this.escape(loc.status)}</span></td>
+                    <td><button class="btn btn-outline" style="padding: 4px 8px; font-size: 11px;" data-loc="${this.escape(loc.locationId)}">Edit</button></td>
                   </tr>
                 `).join('')}
               </tbody>
@@ -3028,49 +3850,68 @@ class AttendanceApp {
       </div>
     `;
 
+    document.getElementById('loc-gps-btn').addEventListener('click', async () => {
+      const st = document.getElementById('loc-gps-status');
+      st.textContent = 'Getting GPS… keep the phone still.';
+      const pos = await geo.getFreshPosition(20000);
+      if (!pos || pos.error) { st.textContent = 'Could not get GPS. Turn on Location and try again.'; return; }
+      document.getElementById('loc-lat-input').value = pos.lat.toFixed(6);
+      document.getElementById('loc-lng-input').value = pos.lng.toFixed(6);
+      st.textContent = `Got it (accuracy ±${pos.acc} m)${pos.acc > 30 ? ' – accuracy is weak, try again in an open area' : ''}.`;
+    });
+
+    container.querySelectorAll('button[data-loc]').forEach((b) => b.addEventListener('click', () => {
+      const loc = locations.find((x) => String(x.locationId) === b.dataset.loc);
+      if (!loc) return;
+      this.editingLocationId = loc.locationId;
+      document.getElementById('loc-id-input').value = loc.locationId;
+      document.getElementById('loc-id-input').disabled = true;
+      document.getElementById('loc-name-input').value = loc.workLocationName || '';
+      document.getElementById('loc-desc-input').value = loc.description || '';
+      document.getElementById('loc-lnd-select').value = loc.landownerId || '';
+      document.getElementById('loc-sup-select').value = loc.supervisorId || '';
+      document.getElementById('loc-status-select').value = loc.status || 'Active';
+      document.getElementById('loc-lat-input').value = loc.latitude ?? '';
+      document.getElementById('loc-lng-input').value = loc.longitude ?? '';
+      document.getElementById('loc-radius-input').value = loc.radiusMeters ?? '';
+      document.getElementById('loc-form-title').textContent = `Edit Location ${loc.locationId}`;
+      document.getElementById('loc-save-btn').textContent = 'Update Location';
+      document.getElementById('loc-cancel-btn').style.display = 'inline-flex';
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }));
+
     document.getElementById('enroll-loc-form').addEventListener('submit', async (e) => {
       e.preventDefault();
-      const locId = document.getElementById('loc-id-input').value.trim();
-      const locName = document.getElementById('loc-name-input').value.trim();
-      const desc = document.getElementById('loc-desc-input').value.trim();
-      const lndSelect = document.getElementById('loc-lnd-select');
-      const landownerId = lndSelect.value;
-      const landownerName = lndSelect.options[lndSelect.selectedIndex]?.getAttribute('data-name') || '';
-      const supervisorId = document.getElementById('loc-sup-select').value;
-      const status = document.getElementById('loc-status-select').value;
+      const isEdit = !!this.editingLocationId;
+      const locId = isEdit ? this.editingLocationId : document.getElementById('loc-id-input').value.trim();
+      if (!isEdit && locations.some((x) => String(x.locationId).toLowerCase() === locId.toLowerCase())) {
+        alert(`Location ID "${locId}" already exists. Use Edit instead.`);
+        return;
+      }
+      const lat = document.getElementById('loc-lat-input').value.trim();
+      const lng = document.getElementById('loc-lng-input').value.trim();
+      const radius = document.getElementById('loc-radius-input').value.trim();
+      if ((lat === '') !== (lng === '')) { alert('Enter both latitude and longitude, or leave both empty.'); return; }
+      if (lat !== '' && (Math.abs(Number(lat)) > 90 || Math.abs(Number(lng)) > 180)) { alert('Latitude/Longitude are out of range.'); return; }
 
+      const lndSelect = document.getElementById('loc-lnd-select');
       const locObj = {
         locationId: locId,
-        workLocationName: locName,
-        description: desc,
-        landownerId: landownerId,
-        landownerName: landownerName,
-        supervisorId: supervisorId,
-        status: status
+        workLocationName: document.getElementById('loc-name-input').value.trim(),
+        description: document.getElementById('loc-desc-input').value.trim(),
+        landownerId: lndSelect.value,
+        landownerName: lndSelect.options[lndSelect.selectedIndex]?.getAttribute('data-name') || '',
+        supervisorId: document.getElementById('loc-sup-select').value,
+        status: document.getElementById('loc-status-select').value,
+        latitude: lat === '' ? '' : Number(lat),
+        longitude: lng === '' ? '' : Number(lng),
+        radiusMeters: radius === '' ? '' : Number(radius)
       };
 
+      const ok = await this.saveMasterAndReport('SAVE_LOCATION', { location: locObj },
+        `${isEdit ? 'Update' : 'Enroll'} location ${locObj.workLocationName}`, `Location ${locObj.workLocationName} saved.`);
+      if (!ok) return;
       await db.put('locations', locObj);
-
-      const apiUrl = await db.getSetting('apiUrl', '');
-      if (navigator.onLine && apiUrl) {
-        try {
-          const currentUser = auth.getCurrentUser() || {};
-          await fetch(apiUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-            body: JSON.stringify({
-              action: 'SAVE_LOCATION',
-              location: locObj,
-              userId: currentUser.userId || 'ADMIN',
-              userRole: currentUser.role || 'Admin'
-            })
-          });
-        } catch (err) {
-          console.warn('[Location] Server sync pending:', err);
-        }
-      }
-
-      this.showToast(`Location ${locName} saved!`, 'success');
       this.renderLocationsView(document.getElementById('view-content-root'));
     });
   }
@@ -3080,20 +3921,45 @@ class AttendanceApp {
      ========================================================================== */
   async renderUsersView(container) {
     const users = await db.getAll('users');
+    const me = auth.getCurrentUser() || {};
 
     container.innerHTML = `
+      <div class="content-card">
+        <div class="card-header">
+          <h3 class="card-title">Add Administrator Account</h3>
+        </div>
+        <div class="card-body">
+          <form id="new-admin-form" class="form-row" style="align-items:flex-end;">
+            <div class="form-group">
+              <label class="form-label required">Username</label>
+              <input type="text" id="new-admin-user" class="form-control" required autocomplete="off" />
+            </div>
+            <div class="form-group">
+              <label class="form-label required">Temporary Password (min. 8)</label>
+              <input type="password" id="new-admin-pass" class="form-control" required autocomplete="new-password" />
+            </div>
+            <div class="form-group">
+              <button type="submit" class="btn btn-primary" style="width:100%">Create Admin</button>
+            </div>
+          </form>
+          <div class="form-helper">Supervisor logins are created on the Supervisors page.</div>
+        </div>
+      </div>
+
       <div class="content-card">
         <div class="card-header">
           <h3 class="card-title">User Accounts & Authentication</h3>
         </div>
         <div class="card-body">
           <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 16px;">
-            Manage credentials for Administrators and Supervisors. Passwords are encrypted with SHA-256 both offline and online.
+            Passwords are stored salted and hashed on the server. A deactivated account is blocked immediately online,
+            and is also blocked offline the next time that phone connects.
           </p>
           <div class="table-responsive">
             <table class="data-table">
               <thead>
                 <tr>
+                  <th>Photo</th>
                   <th>User ID</th>
                   <th>Username</th>
                   <th>Role</th>
@@ -3106,14 +3972,16 @@ class AttendanceApp {
               <tbody>
                 ${users.map((u) => `
                   <tr>
+                    <td>${this.avatarHtml('USER', u.userId, u.username, 40, { onclick: `app.openProfilePhotoModal('USER', '${this.escape(u.userId)}', '${this.escape(u.username)}')` })}</td>
                     <td><small style="font-family: monospace;">${this.escape(u.userId)}</small></td>
-                    <td><strong>${this.escape(u.username)}</strong></td>
-                    <td><span class="status-pill status-online">${u.role}</span></td>
+                    <td><strong>${this.escape(u.username)}</strong>${String(u.mustChangePassword).toUpperCase() === 'TRUE' ? '<small style="display:block;color:#b45309;">must change password</small>' : ''}</td>
+                    <td><span class="status-pill status-online">${this.escape(u.role)}</span></td>
                     <td>${this.escape(u.linkedSupervisorId || 'None (Admin)')}</td>
-                    <td><span class="status-pill ${u.accountStatus === 'Active' ? 'status-online' : 'status-offline'}">${u.accountStatus}</span></td>
-                    <td><small>${this.escape(u.lastLogin || 'Never')}</small></td>
-                    <td>
-                      <button class="btn btn-outline" style="padding: 4px 8px; font-size: 11px;" onclick="app.promptResetPassword('${u.username}')">Reset Password</button>
+                    <td><span class="status-pill ${u.accountStatus === 'Active' ? 'status-online' : 'status-offline'}">${this.escape(u.accountStatus)}</span></td>
+                    <td><small>${this.escape(u.lastLogin ? new Date(u.lastLogin).toLocaleString() : 'Never')}</small></td>
+                    <td style="white-space:nowrap;">
+                      <button class="btn btn-outline" style="padding: 4px 8px; font-size: 11px;" data-reset="${this.escape(u.userId)}">Reset Password</button>
+                      ${u.userId === me.userId ? '' : `<button class="btn ${u.accountStatus === 'Active' ? 'btn-danger' : 'btn-outline'}" style="padding: 4px 8px; font-size: 11px;" data-toggle="${this.escape(u.userId)}">${u.accountStatus === 'Active' ? 'Deactivate' : 'Activate'}</button>`}
                     </td>
                   </tr>
                 `).join('')}
@@ -3123,40 +3991,66 @@ class AttendanceApp {
         </div>
       </div>
     `;
+
+    const byId = (id) => users.find((u) => String(u.userId) === String(id));
+    container.querySelectorAll('button[data-reset]').forEach((b) => b.addEventListener('click', () => this.promptResetPassword(byId(b.dataset.reset))));
+    container.querySelectorAll('button[data-toggle]').forEach((b) => b.addEventListener('click', async () => {
+      const u = byId(b.dataset.toggle);
+      const next = u.accountStatus === 'Active' ? 'Inactive' : 'Active';
+      if (!confirm(`${next === 'Inactive' ? 'Deactivate' : 'Activate'} ${u.username}?`)) return;
+      if (!(await api.isReachable())) { alert('Changing account status needs internet so it takes effect right away.'); return; }
+      try {
+        await api.call('SAVE_USER', { user: { userId: u.userId, username: u.username, role: u.role, linkedSupervisorId: u.linkedSupervisorId, accountStatus: next } });
+        u.accountStatus = next;
+        await db.put('users', u);
+        if (u.linkedSupervisorId) {
+          const sup = await db.get('supervisors', u.linkedSupervisorId);
+          if (sup) { sup.accountStatus = next; await db.put('supervisors', sup); }
+        }
+        this.showToast(`${u.username} is now ${next}.`, 'success');
+        this.renderUsersView(document.getElementById('view-content-root'));
+      } catch (err) {
+        this.showToast(`Not saved: ${err.message}`, 'error');
+      }
+    }));
+
+    document.getElementById('new-admin-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const username = document.getElementById('new-admin-user').value.trim();
+      const pass = document.getElementById('new-admin-pass').value;
+      if (!/^[A-Za-z0-9._-]{3,30}$/.test(username)) { alert('Username: 3-30 letters, numbers, dot, dash or underscore.'); return; }
+      if (pass.length < 8) { alert('Password must be at least 8 characters.'); return; }
+      if (!(await api.isReachable())) { alert('Creating accounts needs internet.'); return; }
+      try {
+        const res = await api.call('SAVE_USER', { user: { username, role: 'Admin', accountStatus: 'Active', newPasswordHash: await auth.hashPassword(pass) } });
+        await db.put('users', res.user);
+        this.showToast(`Admin ${username} created. They must change the password at first login.`, 'success');
+        this.renderUsersView(document.getElementById('view-content-root'));
+      } catch (err) {
+        this.showToast(`Not saved: ${err.message}`, 'error');
+      }
+    });
   }
 
-  async promptResetPassword(username) {
-    const newPass = prompt(`Enter new password for ${username}:`);
-    if (!newPass || !newPass.trim()) return;
-
-    const hash = await auth.hashPassword(newPass.trim());
-    const users = await db.getAll('users');
-    const user = users.find((u) => u.username === username);
-
-    if (user) {
-      user.passwordHash = hash;
-      await db.put('users', user);
-
-      const apiUrl = await db.getSetting('apiUrl', '');
-      if (navigator.onLine && apiUrl) {
-        try {
-          await fetch(apiUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-            body: JSON.stringify({
-              action: 'SAVE_USER',
-              user: user,
-              userId: auth.getCurrentUser()?.userId || 'ADMIN',
-              userRole: 'Admin'
-            })
-          });
-        } catch (e) {
-          console.warn('[User] Server update failed:', e);
+  async promptResetPassword(user) {
+    if (!user) return;
+    const newPass = prompt(`Enter a temporary password for ${user.username} (min. 8 characters).\nThey will be asked to change it at next login.`);
+    if (!newPass) return;
+    if (newPass.trim().length < 8) { alert('Password must be at least 8 characters.'); return; }
+    if (!(await api.isReachable())) { alert('Resetting a password needs internet.'); return; }
+    try {
+      const res = await api.call('SAVE_USER', {
+        user: {
+          userId: user.userId, username: user.username, role: user.role,
+          linkedSupervisorId: user.linkedSupervisorId, accountStatus: user.accountStatus,
+          newPasswordHash: await auth.hashPassword(newPass.trim())
         }
-      }
-
-      this.showToast(`Password updated for user ${username}.`, 'success');
+      });
+      await db.put('users', res.user);
+      this.showToast(`Temporary password set for ${user.username}.`, 'success');
       this.renderUsersView(document.getElementById('view-content-root'));
+    } catch (err) {
+      this.showToast(`Not saved: ${err.message}`, 'error');
     }
   }
 
@@ -3164,14 +4058,33 @@ class AttendanceApp {
      ADMIN MODULE 6: AUDIT TRAIL LOGS
      ========================================================================== */
   async renderAuditView(container) {
-    const localLogs = await db.getAll('auditLogs');
-    localLogs.sort((a, b) => (b.dateTime > a.dateTime ? 1 : -1));
+    container.innerHTML = `<div style="text-align:center;padding:40px;color:var(--text-muted);">Loading audit logs…</div>`;
+    let logs = [];
+    let source = 'server';
+    if (await api.isReachable()) {
+      try {
+        logs = (await api.call('GET_AUDIT_LOGS', { limit: 500 })).logs || [];
+      } catch (e) {
+        source = 'phone';
+      }
+    } else {
+      source = 'phone';
+    }
+    if (source === 'phone') {
+      logs = await db.getAll('auditLogs');
+      logs.sort((a, b) => (b.dateTime > a.dateTime ? 1 : -1));
+    }
 
     container.innerHTML = `
       <div class="content-card">
         <div class="card-header">
           <h3 class="card-title">System Audit Logs & Adjustments</h3>
-          <span class="status-pill status-online">${localLogs.length} Entries</span>
+          <span class="status-pill status-online">${logs.length} Entries ${source === 'server' ? '(latest from Google Sheets)' : '(this phone only – go online for all)'}</span>
+        </div>
+        <div class="toolbar" style="padding: 12px 16px 0;">
+          <div class="search-input-wrapper">
+            <input type="text" id="audit-search" class="search-input" placeholder="Search action, user, record, reason…" />
+          </div>
         </div>
         <div class="card-body" style="padding: 0;">
           <div class="table-responsive">
@@ -3182,25 +4095,592 @@ class AttendanceApp {
                   <th>Action</th>
                   <th>User ID / Role</th>
                   <th>Record ID</th>
+                  <th>Before → After</th>
                   <th>Reason / Details</th>
                 </tr>
               </thead>
-              <tbody>
-                ${localLogs.length === 0 ? `<tr><td colspan="5" style="text-align: center; padding: 32px; color: var(--text-muted);">No audit entries yet. Adjustments and deletions appear here.</td></tr>` : localLogs.map((log) => `
-                  <tr>
-                    <td><small>${this.escape(log.dateTime || '-')}</small></td>
-                    <td><strong>${this.escape(log.action)}</strong></td>
-                    <td>${this.escape(log.userId || '-')} (${this.escape(log.userRole || '-')})</td>
-                    <td><small style="font-family: monospace;">${this.escape(log.recordId || '-')}</small></td>
-                    <td>${this.escape(log.reason || '-')}</td>
-                  </tr>
-                `).join('')}
-              </tbody>
+              <tbody id="audit-body"></tbody>
             </table>
           </div>
         </div>
       </div>
     `;
+
+    const short = (v) => {
+      const t = String(v || '');
+      return t.length > 140 ? t.slice(0, 140) + '…' : t;
+    };
+    const render = () => {
+      const q = (document.getElementById('audit-search').value || '').toLowerCase();
+      const rows = logs.filter((l) => !q || JSON.stringify(l).toLowerCase().includes(q));
+      document.getElementById('audit-body').innerHTML = rows.length === 0
+        ? `<tr><td colspan="6" style="text-align: center; padding: 32px; color: var(--text-muted);">No audit entries.</td></tr>`
+        : rows.map((log) => `
+          <tr>
+            <td><small>${this.escape(log.dateTime ? new Date(log.dateTime).toLocaleString() : '-')}</small></td>
+            <td><strong>${this.escape(log.action)}</strong></td>
+            <td>${this.escape(log.userId || '-')} (${this.escape(log.userRole || '-')})</td>
+            <td><small style="font-family: monospace;">${this.escape(log.recordId || '-')}</small></td>
+            <td><small style="color:var(--text-muted)">${this.escape(short(log.previousValue))}${log.previousValue || log.newValue ? ' → ' : ''}${this.escape(short(log.newValue))}</small></td>
+            <td>${this.escape(log.reason || '-')}</td>
+          </tr>`).join('');
+    };
+    document.getElementById('audit-search').addEventListener('input', render);
+    render();
+  }
+
+  /* ==========================================================================
+     CUT-OFF SUMMARY (per person: present, absent, leave, late, hours, OT)
+     Admin: all manpower (optional supervisor / location filter)
+     Supervisor: only the manpower assigned to them
+     ========================================================================== */
+
+  // Default = the current payroll cut-off: 1-15 or 16-end of month
+  currentCutoff(ref) {
+    const d = ref ? new Date(ref + 'T00:00:00') : new Date();
+    const y = d.getFullYear(), m = d.getMonth();
+    const last = new Date(y, m + 1, 0).getDate();
+    const p = (n) => String(n).padStart(2, '0');
+    const ym = `${y}-${p(m + 1)}`;
+    return d.getDate() <= 15 ? { from: `${ym}-01`, to: `${ym}-15` } : { from: `${ym}-16`, to: `${ym}-${p(last)}` };
+  }
+
+  previousCutoff(fromStr) {
+    return this.currentCutoff(this.shiftDate(fromStr, -1));
+  }
+
+  getCutoffState() {
+    if (!this.cutoff) this.cutoff = Object.assign({ supervisorId: '', location: '' }, this.currentCutoff());
+    return this.cutoff;
+  }
+
+  async loadAttendanceForRange(from, to) {
+    // Use the server when online (covers dates older than what the phone keeps). Cached for 60 s.
+    const key = `${from}|${to}`;
+    let remote = null;
+    if (this._rangeCache && this._rangeCache.key === key && Date.now() - this._rangeCache.at < 60000) {
+      remote = this._rangeCache.data;
+    } else if (auth.getCurrentUser() && auth.getCurrentUser().token && (await api.isReachable())) {
+      try {
+        remote = (await api.call('GET_ATTENDANCE_RANGE', { from, to })).attendance;
+        this._rangeCache = { key, at: Date.now(), data: remote };
+      } catch (e) { remote = null; }
+    }
+    const local = (await db.getAll('attendance')).filter((a) => this.ymd(a.attendanceDate) >= from && this.ymd(a.attendanceDate) <= to);
+    if (!remote) return { records: local, source: 'phone' };
+    // Server data + local changes that are not uploaded yet
+    const map = new Map(remote.map((r) => [r.attendanceRecordId, r]));
+    local.forEach((l) => { if (l.syncStatus !== 'SYNCED' || !map.has(l.attendanceRecordId)) map.set(l.attendanceRecordId, l); });
+    return { records: [...map.values()], source: 'server' };
+  }
+
+  /** Minutes late for one Time IN (0 = on time). Counted from the schedule start once past the grace period. */
+  lateMinutes(timeIn, settings) {
+    const t = this.timeToMinutes(timeIn);
+    const start = this.timeToMinutes(settings.workStartTime || '07:00 AM');
+    if (t === null || start === null) return 0;
+    const late = t - start;
+    return late > Number(settings.lateGraceMinutes || 0) ? late : 0;
+  }
+
+  fmtMinutes(min) {
+    if (!min) return '0';
+    const h = Math.floor(min / 60), m = min % 60;
+    return h ? `${h}h ${String(m).padStart(2, '0')}m` : `${m}m`;
+  }
+
+  /** Builds the per-person summary for a date range. */
+  async computeCutoffSummary({ from, to, supervisorId, location }) {
+    const settings = await auth.getAppSettings();
+    const today = this.todayStr();
+    const restDay = Number(settings.restDay);
+
+    // Working days in the range, up to today, without the rest day
+    const workDays = [];
+    for (let d = from; d <= to && d <= today; d = this.shiftDate(d, 1)) {
+      const [y, m, dd] = d.split('-').map(Number);
+      if (new Date(y, m - 1, dd).getDay() !== restDay) workDays.push(d);
+    }
+
+    const [{ records, source }, allEmployees, supervisors] = await Promise.all([
+      this.loadAttendanceForRange(from, to), db.getAll('employees'), db.getAll('supervisors')
+    ]);
+    const supName = new Map(supervisors.map((s) => [String(s.supervisorId), s.supervisorName]));
+
+    // Role scoping: a supervisor only ever sees their own manpower
+    let sup = supervisorId;
+    if (!auth.isAdmin()) sup = String(auth.getLinkedSupervisorId() || '');
+    let employees = allEmployees;
+    if (sup) employees = employees.filter((e) => String(e.supervisorId || '') === String(sup));
+    if (location) employees = employees.filter((e) => (e.workLocation || '') === location);
+
+    const active = records.filter((r) => r.recordStatus !== 'DELETED');
+    const byEmp = new Map();
+    active.forEach((r) => {
+      const k = String(r.employeeId);
+      if (!byEmp.has(k)) byEmp.set(k, []);
+      byEmp.get(k).push(r);
+    });
+
+    const rows = employees
+      .filter((e) => (e.employmentStatus || 'Active') === 'Active' || byEmp.has(String(e.employeeId)))
+      .map((e) => {
+        const recs = byEmp.get(String(e.employeeId)) || [];
+        const byDate = new Map();
+        recs.forEach((r) => byDate.set(this.ymd(r.attendanceDate), r));
+        const enrolled = e.dateEnrolled || '0000-00-00';
+
+        let present = 0, leave = 0, absent = 0, lateCount = 0, lateMin = 0, hours = 0, ot = 0, noOut = 0, flagged = 0;
+        const days = [];
+        const allDates = new Set([...workDays, ...byDate.keys()]);
+        [...allDates].sort().forEach((d) => {
+          if (d > today) return;
+          const r = byDate.get(d);
+          if (r && this.isLeave(r)) {
+            leave++;
+            days.push({ date: d, status: 'LEAVE', note: r.leaveType || 'Leave' });
+          } else if (r && r.timeIn) {
+            present++;
+            const lm = this.lateMinutes(r.timeIn, settings);
+            if (lm) { lateCount++; lateMin += lm; }
+            const h = r.hoursWorked !== undefined && r.hoursWorked !== '' && r.hoursWorked !== null
+              ? { hours: Number(r.hoursWorked), overtime: Number(r.overtimeHours) || 0 }
+              : this.computeHours(r.timeIn, r.timeOut, settings);
+            if (h.hours === '' || isNaN(h.hours)) noOut++; else { hours += h.hours; ot += h.overtime; }
+            if (String(r.geofenceIn || '').startsWith('OUTSIDE') || String(r.geofenceOut || '').startsWith('OUTSIDE') || r.clockFlag) flagged++;
+            days.push({ date: d, status: 'PRESENT', timeIn: r.timeIn, timeOut: r.timeOut, late: lm, hours: h.hours, adjusted: !!r.adjustedBy });
+          } else if (workDays.includes(d) && d >= enrolled) {
+            absent++;
+            days.push({ date: d, status: 'ABSENT' });
+          }
+        });
+
+        const expected = present + absent;
+        return {
+          id: String(e.employeeId), name: e.employeeName,
+          supId: String(e.supervisorId || ''), sup: supName.get(String(e.supervisorId || '')) || e.supervisorName || 'Unassigned',
+          loc: e.workLocation || '',
+          present, absent, leave, lateCount, lateMin,
+          hours: Math.round(hours * 100) / 100, ot: Math.round(ot * 100) / 100,
+          noOut, flagged, rate: expected ? Math.round((present / expected) * 100) : 0, days
+        };
+      })
+      .sort((a, b) => a.sup.localeCompare(b.sup) || a.name.localeCompare(b.name));
+
+    const totals = rows.reduce((t, r) => {
+      ['present', 'absent', 'leave', 'lateCount', 'lateMin', 'hours', 'ot', 'noOut', 'flagged'].forEach((k) => { t[k] += r[k]; });
+      return t;
+    }, { present: 0, absent: 0, leave: 0, lateCount: 0, lateMin: 0, hours: 0, ot: 0, noOut: 0, flagged: 0 });
+    totals.hours = Math.round(totals.hours * 100) / 100;
+    totals.ot = Math.round(totals.ot * 100) / 100;
+    totals.manpower = rows.length;
+    totals.rate = totals.present + totals.absent ? Math.round((totals.present / (totals.present + totals.absent)) * 100) : 0;
+
+    // Per-supervisor subtotals (admin)
+    const groups = new Map();
+    rows.forEach((r) => {
+      if (!groups.has(r.supId)) groups.set(r.supId, { id: r.supId, name: r.sup, manpower: 0, present: 0, absent: 0, leave: 0, lateCount: 0, lateMin: 0, hours: 0 });
+      const g = groups.get(r.supId);
+      g.manpower++; g.present += r.present; g.absent += r.absent; g.leave += r.leave;
+      g.lateCount += r.lateCount; g.lateMin += r.lateMin; g.hours += r.hours;
+    });
+
+    return { from, to, rows, totals, groups: [...groups.values()], workDays: workDays.length, source, settings };
+  }
+
+  /** Renders the cut-off summary into `host`. Used on both dashboards and on the Cut-off Summary page. */
+  async renderCutoffSection(host, { compact = false } = {}) {
+    if (!host) return;
+    const st = this.getCutoffState();
+    const isAdmin = auth.isAdmin();
+    const [supervisors, employees] = await Promise.all([db.getAll('supervisors'), db.getAll('employees')]);
+    const locs = [...new Set(employees.filter((e) => isAdmin || String(e.supervisorId) === String(auth.getLinkedSupervisorId())).map((e) => e.workLocation).filter(Boolean))].sort();
+    const prev = this.previousCutoff(st.from);
+    const cur = this.currentCutoff();
+
+    host.innerHTML = `
+      <div class="content-card cutoff-card">
+        <div class="card-header" style="flex-wrap:wrap; gap:8px;">
+          <h3 class="card-title">📅 Cut-off Summary ${isAdmin ? '– All Manpower' : '– My Manpower'}</h3>
+          <span style="font-size:12px;color:var(--text-muted)" id="cutoff-range-label"></span>
+        </div>
+        <div class="card-body">
+          <div class="toolbar cutoff-tools" style="margin-bottom:12px;">
+            <label class="cutoff-field">From <input type="date" id="cutoff-from" class="select-filter" value="${st.from}" max="${this.todayStr()}" /></label>
+            <label class="cutoff-field">To <input type="date" id="cutoff-to" class="select-filter" value="${st.to}" /></label>
+            <select id="cutoff-preset" class="select-filter">
+              <option value="">Quick select…</option>
+              <option value="cur">This cut-off (${cur.from.slice(5)} → ${cur.to.slice(5)})</option>
+              <option value="prev">Previous cut-off (${prev.from.slice(5)} → ${prev.to.slice(5)})</option>
+              <option value="month">This whole month</option>
+              <option value="lastmonth">Last month</option>
+            </select>
+            ${isAdmin ? `<select id="cutoff-sup" class="select-filter">
+              <option value="">All Supervisors</option>
+              ${supervisors.map((s) => `<option value="${this.escape(s.supervisorId)}" ${String(st.supervisorId) === String(s.supervisorId) ? 'selected' : ''}>${this.escape(s.supervisorName)}</option>`).join('')}
+            </select>` : ''}
+            ${locs.length > 1 ? `<select id="cutoff-loc" class="select-filter">
+              <option value="">All Locations</option>
+              ${locs.map((l) => `<option value="${this.escape(l)}" ${st.location === l ? 'selected' : ''}>${this.escape(l)}</option>`).join('')}
+            </select>` : ''}
+            <button class="btn btn-primary" id="cutoff-run">Show</button>
+            <button class="btn btn-outline" id="cutoff-csv">⬇ Export CSV</button>
+          </div>
+          <div id="cutoff-out"><div style="text-align:center;padding:24px;color:var(--text-muted);">Calculating…</div></div>
+        </div>
+      </div>
+    `;
+
+    const readInputs = () => {
+      st.from = host.querySelector('#cutoff-from').value;
+      st.to = host.querySelector('#cutoff-to').value;
+      st.supervisorId = isAdmin ? (host.querySelector('#cutoff-sup')?.value || '') : '';
+      st.location = host.querySelector('#cutoff-loc')?.value || '';
+    };
+    const run = async () => {
+      readInputs();
+      const out = host.querySelector('#cutoff-out');
+      if (!st.from || !st.to) { out.innerHTML = '<div class="alert-banner warn">Choose both dates.</div>'; return; }
+      if (st.to < st.from) { out.innerHTML = '<div class="alert-banner warn">"To" date must be on or after the "From" date.</div>'; return; }
+      const span = (Date.parse(st.to) - Date.parse(st.from)) / 86400000;
+      if (span > 92) { out.innerHTML = '<div class="alert-banner warn">Please choose at most 3 months at a time.</div>'; return; }
+      out.innerHTML = '<div style="text-align:center;padding:24px;color:var(--text-muted);">Calculating…</div>';
+      const data = await this.computeCutoffSummary(st);
+      this.lastCutoff = data;
+      this.renderCutoffResult(host, data, compact);
+    };
+
+    host.querySelector('#cutoff-preset').addEventListener('change', (ev) => {
+      const v = ev.target.value;
+      const t = this.todayStr();
+      let r = null;
+      if (v === 'cur') r = this.currentCutoff();
+      if (v === 'prev') r = this.previousCutoff(this.currentCutoff().from);
+      if (v === 'month' || v === 'lastmonth') {
+        const base = v === 'month' ? t : this.shiftDate(t.slice(0, 8) + '01', -1);
+        const [y, m] = base.split('-').map(Number);
+        r = { from: `${base.slice(0, 7)}-01`, to: `${base.slice(0, 7)}-${String(new Date(y, m, 0).getDate()).padStart(2, '0')}` };
+      }
+      if (r) {
+        host.querySelector('#cutoff-from').value = r.from;
+        host.querySelector('#cutoff-to').value = r.to;
+        run();
+      }
+      ev.target.value = '';
+    });
+    host.querySelector('#cutoff-run').addEventListener('click', run);
+    ['#cutoff-sup', '#cutoff-loc'].forEach((sel) => { const el = host.querySelector(sel); if (el) el.addEventListener('change', run); });
+    host.querySelector('#cutoff-csv').addEventListener('click', () => this.exportCutoffCsv());
+    run();
+  }
+
+  renderCutoffResult(host, data, compact) {
+    const { rows, totals, groups, settings } = data;
+    const isAdmin = auth.isAdmin();
+    const pretty = (d) => new Date(d + 'T00:00:00').toLocaleDateString('en-PH', { month: 'short', day: 'numeric', year: 'numeric' });
+    host.querySelector('#cutoff-range-label').textContent = `${pretty(data.from)} – ${pretty(data.to)} • ${data.workDays} working day(s) so far`;
+    const out = host.querySelector('#cutoff-out');
+
+    const showGroups = isAdmin && !this.cutoff.supervisorId && groups.length > 1;
+    out.innerHTML = `
+      ${data.source === 'phone' ? '<div class="alert-banner warn">Offline: using only the records saved on this phone. Go online for the complete cut-off.</div>' : ''}
+      <div class="metrics-grid">
+        <div class="metric-card"><span class="metric-title">${isAdmin ? 'Total Manpower' : 'My Manpower'}</span><div class="metric-value">${totals.manpower}</div></div>
+        <div class="metric-card"><span class="metric-title">Present (man-days)</span><div class="metric-value" style="color:var(--primary)">${totals.present}</div></div>
+        <div class="metric-card"><span class="metric-title">Absent (man-days)</span><div class="metric-value" style="color:var(--accent-red)">${totals.absent}</div></div>
+        <div class="metric-card"><span class="metric-title">Leave (man-days)</span><div class="metric-value" style="color:#b45309">${totals.leave}</div></div>
+        <div class="metric-card"><span class="metric-title">Total Late</span><div class="metric-value" style="color:#b45309">${totals.lateCount}<small style="font-size:13px;color:var(--text-muted)"> times · ${this.fmtMinutes(totals.lateMin)}</small></div></div>
+        <div class="metric-card"><span class="metric-title">Attendance Rate</span><div class="metric-value">${totals.rate}%</div></div>
+      </div>
+
+      ${showGroups ? `
+      <div class="table-responsive" style="margin-bottom:16px;">
+        <table class="data-table keep-table">
+          <thead><tr><th>Supervisor</th><th>Manpower</th><th>Present</th><th>Absent</th><th>Leave</th><th>Late</th><th>Late Time</th><th>Hours</th></tr></thead>
+          <tbody>
+            ${groups.map((g) => `
+              <tr class="clickable-row" data-supfilter="${this.escape(g.id)}">
+                <td><span class="name-with-avatar">${(() => { const k = this.supervisorAvatarKey(g.id); return this.avatarHtml(k ? k.type : '', k ? k.id : '', g.name, 28); })()}<strong>${this.escape(g.name)}</strong></span></td><td>${g.manpower}</td>
+                <td style="color:var(--primary);font-weight:700">${g.present}</td>
+                <td style="color:var(--accent-red);font-weight:700">${g.absent}</td>
+                <td>${g.leave}</td><td>${g.lateCount}</td><td>${this.fmtMinutes(g.lateMin)}</td><td>${Math.round(g.hours * 10) / 10}</td>
+              </tr>`).join('')}
+            <tr class="total-row"><td><strong>TOTAL</strong></td><td><strong>${totals.manpower}</strong></td><td><strong>${totals.present}</strong></td><td><strong>${totals.absent}</strong></td><td><strong>${totals.leave}</strong></td><td><strong>${totals.lateCount}</strong></td><td><strong>${this.fmtMinutes(totals.lateMin)}</strong></td><td><strong>${Math.round(totals.hours * 10) / 10}</strong></td></tr>
+          </tbody>
+        </table>
+      </div>` : ''}
+
+      <div class="search-input-wrapper" style="margin-bottom:10px; max-width:340px;">
+        <input type="text" class="search-input" id="cutoff-search" placeholder="Search name or ID…" />
+      </div>
+      <div class="table-responsive">
+        <table class="data-table">
+          <thead><tr>
+            <th>Employee ID</th><th>Name</th>${isAdmin ? '<th>Supervisor</th>' : ''}<th>Present</th><th>Absent</th><th>Leave</th>
+            <th>Late (times)</th><th>Late Time</th><th>Hours</th><th>OT</th>${compact ? '' : '<th>No Time OUT</th><th>Flagged</th>'}<th></th>
+          </tr></thead>
+          <tbody id="cutoff-rows"></tbody>
+        </table>
+      </div>
+      <div class="form-helper" style="margin-top:8px;">
+        Late = Time IN after ${this.escape(settings.workStartTime || '07:00 AM')}${Number(settings.lateGraceMinutes) ? ` + ${settings.lateGraceMinutes} min grace (late time is counted from ${this.escape(settings.workStartTime || '07:00 AM')})` : ''}.
+        Absent = working day with no Time IN and no leave (rest day and days before enrollment are not counted). Tap a person to see each day.
+      </div>
+    `;
+
+    const draw = () => {
+      const q = (out.querySelector('#cutoff-search').value || '').toLowerCase();
+      const list = rows.filter((r) => !q || r.name.toLowerCase().includes(q) || r.id.toLowerCase().includes(q));
+      out.querySelector('#cutoff-rows').innerHTML = list.length === 0
+        ? `<tr><td colspan="13" style="text-align:center;padding:24px;color:var(--text-muted)">No manpower found.</td></tr>`
+        : list.map((r) => `
+          <tr class="clickable-row" data-emp="${this.escape(r.id)}">
+            <td><span class="emp-id-badge">${this.escape(r.id)}</span></td>
+            <td><span class="name-with-avatar">${this.avatarHtml('EMPLOYEE', r.id, r.name, 28)}<strong>${this.escape(r.name)}</strong></span></td>
+            ${isAdmin ? `<td>${this.escape(r.sup)}</td>` : ''}
+            <td><strong style="color:var(--primary)">${r.present}</strong></td>
+            <td>${r.absent ? `<strong style="color:var(--accent-red)">${r.absent}</strong>` : '0'}</td>
+            <td>${r.leave || '0'}</td>
+            <td>${r.lateCount ? `<span class="flag-pill flag-warn">${r.lateCount}</span>` : '0'}</td>
+            <td>${r.lateMin ? this.fmtMinutes(r.lateMin) : '-'}</td>
+            <td>${r.hours}</td>
+            <td>${r.ot || '-'}</td>
+            ${compact ? '' : `<td>${r.noOut ? `<span class="flag-pill flag-warn">${r.noOut}</span>` : '-'}</td><td>${r.flagged ? `<span class="flag-pill flag-bad">${r.flagged}</span>` : '-'}</td>`}
+            <td><button class="btn btn-outline view-btn">Days ›</button></td>
+          </tr>`).join('');
+      out.querySelectorAll('tr[data-emp]').forEach((tr) => tr.addEventListener('click', () => this.showCutoffPersonDetail(tr.dataset.emp)));
+    };
+    out.querySelector('#cutoff-search').addEventListener('input', draw);
+    out.querySelectorAll('tr[data-supfilter]').forEach((tr) => tr.addEventListener('click', () => {
+      const sel = host.querySelector('#cutoff-sup');
+      if (sel) { sel.value = tr.dataset.supfilter; sel.dispatchEvent(new Event('change')); }
+    }));
+    draw();
+  }
+
+  showCutoffPersonDetail(empId) {
+    const data = this.lastCutoff;
+    if (!data) return;
+    const r = data.rows.find((x) => x.id === empId);
+    if (!r) return;
+    const dayName = (d) => new Date(d + 'T00:00:00').toLocaleDateString('en-PH', { weekday: 'short', month: 'short', day: 'numeric' });
+    this.showGenericModal({
+      title: `${r.name} (${r.id})`,
+      body: `
+        <div style="display:flex;justify-content:center;margin-bottom:8px;">${this.avatarHtml('EMPLOYEE', r.id, r.name, 72)}</div>
+        <div style="font-size:13px;color:var(--text-muted);margin-bottom:10px;">${this.escape(data.from)} → ${this.escape(data.to)} • ${this.escape(r.sup)} • ${this.escape(r.loc)}</div>
+        <div class="metrics-grid" style="margin-bottom:12px;">
+          <div class="metric-card"><span class="metric-title">Present</span><div class="metric-value" style="color:var(--primary)">${r.present}</div></div>
+          <div class="metric-card"><span class="metric-title">Absent</span><div class="metric-value" style="color:var(--accent-red)">${r.absent}</div></div>
+          <div class="metric-card"><span class="metric-title">Late</span><div class="metric-value" style="color:#b45309">${r.lateCount}<small style="font-size:12px"> · ${this.fmtMinutes(r.lateMin)}</small></div></div>
+        </div>
+        <div class="table-responsive"><table class="data-table keep-table">
+          <thead><tr><th>Date</th><th>Status</th><th>IN</th><th>OUT</th><th>Late</th><th>Hours</th></tr></thead>
+          <tbody>${r.days.length === 0 ? '<tr><td colspan="6" style="text-align:center;padding:16px;">No working days in this range yet.</td></tr>' : r.days.map((d) => `
+            <tr>
+              <td>${dayName(d.date)}</td>
+              <td>${d.status === 'PRESENT' ? '<span class="flag-pill flag-ok">Present</span>' : d.status === 'LEAVE' ? `<span class="status-pill badge-leave">${this.escape(d.note)}</span>` : '<span class="flag-pill flag-bad">Absent</span>'}${d.adjusted ? ' <span class="flag-pill flag-warn">Adj</span>' : ''}</td>
+              <td>${this.escape(d.timeIn || '-')}</td>
+              <td>${this.escape(d.timeOut || '-')}</td>
+              <td>${d.late ? `<strong style="color:#b45309">${this.fmtMinutes(d.late)}</strong>` : '-'}</td>
+              <td>${d.hours !== undefined && d.hours !== '' ? d.hours : '-'}</td>
+            </tr>`).join('')}
+          </tbody>
+        </table></div>`
+    });
+  }
+
+  exportCutoffCsv() {
+    const data = this.lastCutoff;
+    if (!data || !data.rows.length) { alert('Nothing to export yet.'); return; }
+    const head = ['Cut-off From', 'Cut-off To', 'Employee ID', 'Employee Name', 'Supervisor', 'Work Location', 'Working Days',
+      'Days Present', 'Days Absent', 'Days Leave', 'Times Late', 'Late Minutes', 'Total Hours', 'Overtime Hours', 'Days Without Time OUT', 'Flagged Days', 'Attendance Rate %'];
+    const lines = data.rows.map((r) => [data.from, data.to, r.id, r.name, r.sup, r.loc, data.workDays, r.present, r.absent, r.leave,
+      r.lateCount, r.lateMin, r.hours, r.ot, r.noOut, r.flagged, r.rate].map((v) => this.csvCell(v)).join(','));
+    const t = data.totals;
+    lines.push(['', '', '', 'TOTAL', '', '', '', t.present, t.absent, t.leave, t.lateCount, t.lateMin, t.hours, t.ot, t.noOut, t.flagged, t.rate].map((v) => this.csvCell(v)).join(','));
+    this.downloadText('﻿' + [head.map((h) => this.csvCell(h)).join(','), ...lines].join('\r\n'), `Cutoff_Summary_${data.from}_to_${data.to}.csv`);
+  }
+
+  async renderReportsView(container) {
+    container.innerHTML = '<div id="cutoff-page-host"></div>';
+    this.renderCutoffSection(document.getElementById('cutoff-page-host'));
+  }
+
+  /* ==========================================================================
+     ADMIN: PHOTO, GPS & PAY RULES
+     ========================================================================== */
+  async renderAppSettingsView(container) {
+    const s = await auth.getAppSettings();
+    const opt = (val, cur, label) => `<option value="${val}" ${String(val) === String(cur) ? 'selected' : ''}>${label}</option>`;
+    container.innerHTML = `
+      <div class="content-card">
+        <div class="card-header"><h3 class="card-title">Rules for all phones</h3><span style="font-size:12px;color:var(--text-muted)">Phones receive changes at their next sync.</span></div>
+        <div class="card-body">
+          <form id="rules-form">
+            <h4 style="font-size:14px;margin-bottom:8px;">📷 Time IN / Time OUT photo</h4>
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label">Photo</label>
+                <select id="r-photoMode" class="form-control">
+                  ${opt('required', s.photoMode, 'Required (cannot skip)')}
+                  ${opt('optional', s.photoMode, 'Optional (Skip button shown)')}
+                  ${opt('off', s.photoMode, 'Off (no photo)')}
+                </select>
+                <div class="form-helper">Photos are watermarked with time, date, employee, area and GPS, then saved to Google Drive.</div>
+              </div>
+            </div>
+
+            <h4 style="font-size:14px;margin:12px 0 8px;">📍 Geofence</h4>
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label">When outside the work area</label>
+                <select id="r-geofenceMode" class="form-control">
+                  ${opt('warn', s.geofenceMode, 'Warn and flag (recommended)')}
+                  ${opt('block', s.geofenceMode, 'Block Time IN / OUT')}
+                  ${opt('off', s.geofenceMode, 'Off')}
+                </select>
+              </div>
+              <div class="form-group">
+                <label class="form-label">Default radius (m)</label>
+                <input type="number" id="r-defaultRadiusMeters" class="form-control" min="10" max="20000" value="${this.escape(s.defaultRadiusMeters)}" />
+                <div class="form-helper">Used when a location has no radius.</div>
+              </div>
+              <div class="form-group">
+                <label class="form-label">Weak GPS above (m)</label>
+                <input type="number" id="r-maxGpsAccuracyMeters" class="form-control" min="5" max="5000" value="${this.escape(s.maxGpsAccuracyMeters)}" />
+              </div>
+            </div>
+
+            <h4 style="font-size:14px;margin:12px 0 8px;">⏱ Schedule, late, hours & overtime</h4>
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label">Work starts at</label>
+                <input type="text" id="r-workStartTime" class="form-control" placeholder="07:00 AM" value="${this.escape(s.workStartTime)}" />
+                <div class="form-helper">Time IN after this (plus grace) counts as late.</div>
+              </div>
+              <div class="form-group">
+                <label class="form-label">Grace period (minutes)</label>
+                <input type="number" id="r-lateGraceMinutes" class="form-control" min="0" max="120" value="${this.escape(s.lateGraceMinutes)}" />
+                <div class="form-helper">e.g. 15 = 07:15 is still on time, 07:16 is 16 min late.</div>
+              </div>
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label">Regular hours per day</label>
+                <input type="number" step="0.5" id="r-regularHours" class="form-control" min="1" max="24" value="${this.escape(s.regularHours)}" />
+              </div>
+              <div class="form-group">
+                <label class="form-label">Unpaid break (minutes)</label>
+                <input type="number" id="r-breakMinutes" class="form-control" min="0" max="240" value="${this.escape(s.breakMinutes)}" />
+              </div>
+              <div class="form-group">
+                <label class="form-label">Deduct break when day is at least (hours)</label>
+                <input type="number" step="0.5" id="r-breakAfterHours" class="form-control" min="0" max="24" value="${this.escape(s.breakAfterHours)}" />
+              </div>
+              <div class="form-group">
+                <label class="form-label">Rest day (not counted as absent)</label>
+                <select id="r-restDay" class="form-control">
+                  ${['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'].map((d, i) => opt(i, s.restDay, d)).join('')}
+                  ${opt(-1, s.restDay, 'No rest day')}
+                </select>
+              </div>
+            </div>
+
+            <h4 style="font-size:14px;margin:12px 0 8px;">📱 Phones</h4>
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label">Attendance days kept on phones</label>
+                <input type="number" id="r-attendanceDays" class="form-control" min="7" max="366" value="${this.escape(s.attendanceDays)}" />
+              </div>
+              <div class="form-group">
+                <label class="form-label">Offline login allowed for (days)</label>
+                <input type="number" id="r-offlineLoginDays" class="form-control" min="1" max="90" value="${this.escape(s.offlineLoginDays)}" />
+              </div>
+              <div class="form-group">
+                <label class="form-label">Flag phone clock off by more than (min)</label>
+                <input type="number" id="r-maxClockDriftMinutes" class="form-control" min="1" max="120" value="${this.escape(s.maxClockDriftMinutes)}" />
+              </div>
+            </div>
+
+            <div style="text-align:right;margin-top:10px;"><button type="submit" class="btn btn-primary">Save Rules</button></div>
+          </form>
+        </div>
+      </div>
+    `;
+
+    document.getElementById('rules-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      if (!(await api.isReachable())) { alert('Saving rules needs internet.'); return; }
+      const startNorm = this.normalizeTime(document.getElementById('r-workStartTime').value);
+      if (!startNorm) { alert('"Work starts at" must be a time like 07:00 AM.'); return; }
+      document.getElementById('r-workStartTime').value = startNorm;
+      const keys = ['workStartTime', 'lateGraceMinutes', 'photoMode', 'geofenceMode', 'defaultRadiusMeters', 'maxGpsAccuracyMeters', 'regularHours', 'breakMinutes', 'breakAfterHours', 'restDay', 'attendanceDays', 'offlineLoginDays', 'maxClockDriftMinutes'];
+      const settings = {};
+      keys.forEach((k) => {
+        const v = document.getElementById(`r-${k}`).value;
+        settings[k] = ['photoMode', 'geofenceMode', 'workStartTime'].includes(k) ? v : Number(v);
+      });
+      try {
+        const res = await api.call('SAVE_APP_SETTINGS', { settings });
+        await db.setSetting('appSettings', res.settings);
+        this._rangeCache = null;
+        this.showToast('Rules saved. Phones get them at their next sync.', 'success');
+      } catch (err) {
+        this.showToast(`Not saved: ${err.message}`, 'error');
+      }
+    });
+  }
+
+  /* ==========================================================================
+     CHANGE PASSWORD (forced after first login / reset, or voluntary)
+     ========================================================================== */
+  openChangePasswordModal(forced) {
+    this.showGenericModal({
+      title: forced ? '🔒 Please set your own password' : '🔒 Change My Password',
+      locked: forced,
+      body: `
+        ${forced ? '<div class="alert-banner warn">You are using a temporary password. Choose your own password to continue.</div>' : ''}
+        <form id="pw-form" onsubmit="return false;">
+          <div class="form-group">
+            <label class="form-label required">Current password</label>
+            <input type="password" id="pw-current" class="form-control" autocomplete="current-password" />
+          </div>
+          <div class="form-group">
+            <label class="form-label required">New password (min. 8 characters)</label>
+            <input type="password" id="pw-new" class="form-control" autocomplete="new-password" />
+          </div>
+          <div class="form-group">
+            <label class="form-label required">Repeat new password</label>
+            <input type="password" id="pw-new2" class="form-control" autocomplete="new-password" />
+          </div>
+          <div id="pw-error" class="alert-banner bad" style="display:none"></div>
+        </form>`,
+      footer: `
+        ${forced ? `<button type="button" class="btn btn-outline" onclick="app.closeModal('generic-modal'); document.getElementById('logout-btn').click();">Sign out</button>` : `<button type="button" class="btn btn-outline" onclick="app.closeModal('generic-modal')">Cancel</button>`}
+        <button type="button" class="btn btn-primary" id="pw-save">Save Password</button>`,
+      onOpen: () => {
+        document.getElementById('pw-save').onclick = async () => {
+          const err = document.getElementById('pw-error');
+          const show = (m) => { err.textContent = m; err.style.display = 'block'; };
+          const cur = document.getElementById('pw-current').value;
+          const n1 = document.getElementById('pw-new').value;
+          const n2 = document.getElementById('pw-new2').value;
+          if (n1 !== n2) return show('The new passwords do not match.');
+          if (!(await api.isReachable())) return show('You need internet to change your password.');
+          try {
+            await auth.changePassword(cur, n1);
+            this.closeModal('generic-modal');
+            this.showToast('Password changed.', 'success');
+            if (auth.isSupervisor() && (!this.sessionLandowner || !this.sessionLandowner.name)) {
+              setTimeout(() => this.promptSelectSessionLandowner(), 300);
+            }
+          } catch (e) {
+            show(e.message);
+          }
+        };
+      }
+    });
   }
 
   /* ==========================================================================
@@ -3213,16 +4693,24 @@ class AttendanceApp {
 
     const currentUrl = await db.getSetting('apiUrl', '');
     input.value = currentUrl;
+    const status = document.getElementById('settings-test-status');
+    status.textContent = '';
+
+    // Changing the server URL while logged in would mix data from two databases
+    const loggedIn = !!auth.getCurrentUser();
+    input.readOnly = loggedIn && !auth.isAdmin() && !!currentUrl;
 
     document.getElementById('save-settings-btn').onclick = async () => {
       const newUrl = input.value.trim();
+      if (newUrl && !/^https:\/\/script\.google\.com\/macros\/s\/[\w-]+\/exec$/.test(newUrl)) {
+        status.textContent = 'This does not look like an Apps Script Web App URL (it should end with /exec).';
+        status.style.color = 'var(--accent-red)';
+        return;
+      }
       await db.setSetting('apiUrl', newUrl);
       this.showToast('Google Apps Script API URL saved.', 'success');
       this.closeModal('settings-modal');
-
-      if (newUrl && navigator.onLine) {
-        syncService.pullRemoteData();
-      }
+      if (newUrl && navigator.onLine && loggedIn) syncService.pullRemoteData();
     };
 
     document.getElementById('test-api-btn').onclick = async () => {
@@ -3231,27 +4719,15 @@ class AttendanceApp {
         alert('Please enter a Google Apps Script Web App URL first.');
         return;
       }
-      const testStatusEl = document.getElementById('settings-test-status');
-      testStatusEl.textContent = 'Testing connection...';
-      testStatusEl.style.color = 'var(--text-muted)';
-
+      status.textContent = 'Testing connection...';
+      status.style.color = 'var(--text-muted)';
       try {
-        const res = await fetch(testUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-          body: JSON.stringify({ action: 'SETUP_DB' })
-        });
-        const data = await res.json();
-        if (data && data.success) {
-          testStatusEl.textContent = '✓ Connected successfully! Google Sheets database is ready.';
-          testStatusEl.style.color = 'var(--primary)';
-        } else {
-          testStatusEl.textContent = `Server responded: ${data.error || 'Unknown error'}`;
-          testStatusEl.style.color = 'var(--accent-red)';
-        }
+        const data = await api.call('PING', {}, { noToken: true, url: testUrl });
+        status.textContent = `✓ Connected (server v${data.version || '?'}). Google Sheets database is ready.`;
+        status.style.color = 'var(--primary)';
       } catch (err) {
-        testStatusEl.textContent = `Connection failed: ${err.message}. Check Web App deployment permissions (set to 'Anyone').`;
-        testStatusEl.style.color = 'var(--accent-red)';
+        status.textContent = `Connection failed: ${err.message}`;
+        status.style.color = 'var(--accent-red)';
       }
     };
 
