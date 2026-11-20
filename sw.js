@@ -1,9 +1,10 @@
-// Service Worker for Employee Attendance Monitoring System
-// Strategy: NETWORK FIRST for the app's own files.
-//   - Online: always loads the latest version from GitHub, then saves a copy.
-//   - Offline: falls back to the saved copy.
-// You no longer need to change the version number for updates to show up.
-const CACHE_NAME = 'attendance-app-v2.0.0';
+// Service Worker for CocoTrack Attendance System (v3)
+// Strategy: NETWORK FIRST with a 3.5-second timeout for the app's own files.
+//   - Good signal: loads the latest version from GitHub, then saves a copy.
+//   - Weak / no signal: after 3.5 s it opens the saved copy instead of hanging.
+// Bump CACHE_NAME only if you rename or remove files.
+const CACHE_NAME = 'cocotrack-v3.2.0';
+const NETWORK_TIMEOUT_MS = 3500;
 
 const ASSETS_TO_CACHE = [
   './',
@@ -11,13 +12,18 @@ const ASSETS_TO_CACHE = [
   './css/styles.css',
   './js/db.js',
   './js/auth.js',
+  './js/api.js',
   './js/sync.js',
+  './js/camera.js',
   './js/app.js',
   './manifest.json',
   './icons/logo-full.png',
   './icons/logo-emblem.png',
   './icons/favicon-64.png',
   './icons/app-icon-192.png',
+  './icons/app-icon-512.png',
+  './icons/app-icon-maskable-192.png',
+  './icons/app-icon-maskable-512.png',
   './icons/apple-touch-icon-v2.png'
 ];
 
@@ -92,27 +98,45 @@ self.addEventListener('fetch', (event) => {
   // Other outside sites: leave alone
   if (requestUrl.origin !== self.location.origin) return;
 
-  // App files: NETWORK FIRST, fall back to saved copy when offline
-  event.respondWith(
-    fetch(request.url, { cache: 'no-cache' })
+  // App files: NETWORK FIRST with timeout, fall back to saved copy
+  event.respondWith(networkFirstWithTimeout(request));
+});
+
+function fromCache(request) {
+  return caches.match(request, { ignoreSearch: true }).then((cached) => {
+    if (cached) return cached;
+    if (request.mode === 'navigate') return caches.match('./index.html');
+    return null;
+  });
+}
+
+function networkFirstWithTimeout(request) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (resp) => { if (!settled && resp) { settled = true; resolve(resp); } };
+
+    const network = fetch(request.url, { cache: 'no-cache' })
       .then((networkResponse) => {
         if (networkResponse && networkResponse.ok) {
           const copy = networkResponse.clone();
           caches.open(CACHE_NAME).then((cache) => cache.put(request, copy));
         }
         return cleanResponse(networkResponse);
-      })
-      .catch(() =>
-        caches.match(request, { ignoreSearch: true }).then((cached) => {
-          if (cached) return cached;
-          if (request.mode === 'navigate') {
-            return caches.match('./index.html');
-          }
-          return new Response('', { status: 504, statusText: 'Offline' });
-        })
-      )
-  );
-});
+      });
+
+    // Slow network: serve the saved copy (the network result still refreshes the cache)
+    const timer = setTimeout(() => {
+      fromCache(request).then(finish);
+    }, NETWORK_TIMEOUT_MS);
+
+    network
+      .then((resp) => { clearTimeout(timer); finish(resp); })
+      .catch(() => {
+        clearTimeout(timer);
+        fromCache(request).then((cached) => finish(cached || new Response('', { status: 504, statusText: 'Offline' })));
+      });
+  });
+}
 
 // Background Sync (when connection resumes and browser supports it)
 self.addEventListener('sync', (event) => {
