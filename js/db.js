@@ -5,7 +5,7 @@
 class AttendanceDB {
   constructor() {
     this.dbName = 'AttendanceSystemDB';
-    this.dbVersion = 1;
+    this.dbVersion = 3; // v2: photos, credentials, outbox · v3: avatars
     this.db = null;
   }
 
@@ -72,10 +72,34 @@ class AttendanceDB {
         if (!db.objectStoreNames.contains('settings')) {
           db.createObjectStore('settings', { keyPath: 'key' });
         }
+
+        // 9. Photos (watermarked Time IN / OUT pictures waiting for upload, kept after upload)
+        if (!db.objectStoreNames.contains('photos')) {
+          const photoStore = db.createObjectStore('photos', { keyPath: 'photoId' });
+          photoStore.createIndex('recordId', 'recordId', { unique: false });
+          photoStore.createIndex('syncStatus', 'syncStatus', { unique: false });
+        }
+
+        // 10. Offline login credentials (PBKDF2 hash, separate from the admin's user list)
+        if (!db.objectStoreNames.contains('credentials')) {
+          db.createObjectStore('credentials', { keyPath: 'username' });
+        }
+
+        // 12. Avatars: user profile pictures & employee registration photos (key "USER:id" / "EMPLOYEE:id")
+        if (!db.objectStoreNames.contains('avatars')) {
+          db.createObjectStore('avatars', { keyPath: 'key' });
+        }
+
+        // 11. Outbox: admin changes (employees, locations, users...) made while offline
+        if (!db.objectStoreNames.contains('outbox')) {
+          db.createObjectStore('outbox', { keyPath: 'id' });
+        }
       };
 
       request.onsuccess = (event) => {
         this.db = event.target.result;
+        // Another tab opened a newer version: close so the upgrade can continue
+        this.db.onversionchange = () => { this.db.close(); this.db = null; };
         console.log('[DB] IndexedDB initialized successfully.');
         resolve(this.db);
       };
@@ -162,6 +186,19 @@ class AttendanceDB {
       request.onsuccess = () => resolve(request.result || []);
       request.onerror = () => reject(request.error);
     });
+  }
+
+  /**
+   * Save a locally changed attendance record. Every local change bumps localRev so the
+   * sync engine can tell whether the record changed while an upload was in progress.
+   */
+  async saveAttendance(record) {
+    record.localRev = (Number(record.localRev) || 0) + 1;
+    record.syncStatus = 'PENDING';
+    record.syncError = '';
+    record.updatedAt = new Date().toISOString();
+    await this.put('attendance', record);
+    return record;
   }
 
   async getPendingAttendance() {
