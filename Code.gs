@@ -1,27 +1,58 @@
 /**
- * EMPLOYEE ATTENDANCE MONITORING SYSTEM - BACKEND (GOOGLE APPS SCRIPT)
- * 
- * Google Sheets Database Structure:
- * 1. Employees
- * 2. Supervisors
- * 3. Landowners
- * 4. Work Locations
- * 5. Attendance
- * 6. Audit Logs
- * 7. Users
+ * COCOTRACK ATTENDANCE SYSTEM - BACKEND (GOOGLE APPS SCRIPT) v3
+ *
+ * What changed in v3
+ *  - Every request (except PING and LOGIN) needs a session token issued at login.
+ *    Role and supervisor are read from the Users sheet, never trusted from the phone.
+ *  - Passwords are stored salted + iterated. Old unsalted hashes still work once and are
+ *    upgraded automatically on the next successful login.
+ *  - Time IN / Time OUT photos (with watermark) are saved to Google Drive
+ *    ("CocoTrack Photos/yyyy-MM") and linked in the Attendance sheet.
+ *  - Geofence distance, hours worked and overtime are calculated on the server.
+ *  - Leading zeros in IDs are preserved (cells are formatted as text BEFORE writing).
+ *  - The phone only downloads recent attendance (default 60 days); reports use date ranges.
+ *
+ * Deploy: Execute as "Me", Who has access "Anyone". The first deploy after this update will
+ * ask for Google Drive permission (needed for photos).
  */
 
-const SHEET_NAMES = {
+var APP_VERSION = '3.0.0';
+var DB_VERSION = '4'; // v4: Profile Photos sheet
+var SESSION_DAYS = 30;
+var HASH_ITERATIONS = 500;
+var MAX_SYNC_RECORDS = 100;
+var MAX_PHOTOS_PER_REQUEST = 4;
+var MAX_PHOTO_BYTES = 2.5 * 1024 * 1024;
+var PHOTO_ROOT_FOLDER = 'CocoTrack Photos';
+
+var DEFAULT_SETTINGS = {
+  photoMode: 'required',     // required | optional | off
+  geofenceMode: 'warn',      // off | warn | block
+  defaultRadiusMeters: 300,  // used when a location has no radius
+  maxGpsAccuracyMeters: 100, // GPS readings worse than this are flagged
+  regularHours: 8,
+  breakMinutes: 60,          // deducted when the day is at least breakAfterHours long
+  breakAfterHours: 5,
+  restDay: 0,                // 0 = Sunday ... 6 = Saturday, -1 = none
+  attendanceDays: 60,        // how many days of attendance a phone downloads
+  offlineLoginDays: 30,      // how long a phone may log in offline after the last online login
+  maxClockDriftMinutes: 5,
+  workStartTime: '07:00 AM', // Time IN after this (+ grace) is late
+  lateGraceMinutes: 0
+};
+
+var SHEET_NAMES = {
   EMPLOYEES: 'Employees',
   SUPERVISORS: 'Supervisors',
   LANDOWNERS: 'Landowners',
   LOCATIONS: 'Work Locations',
   ATTENDANCE: 'Attendance',
   AUDIT_LOGS: 'Audit Logs',
-  USERS: 'Users'
+  USERS: 'Users',
+  PROFILE_PHOTOS: 'Profile Photos'
 };
 
-const HEADERS = {
+var HEADERS = {
   EMPLOYEES: [
     'Employee ID', 'Employee Name', 'Position', 'Department',
     'Supervisor ID', 'Supervisor Name', 'Landowner ID', 'Landowner Name',
@@ -34,7 +65,8 @@ const HEADERS = {
     'Landowner ID', 'Landowner Name', 'Location ID', 'Work Location', 'Supervisor ID', 'Status'
   ],
   LOCATIONS: [
-    'Location ID', 'Work Location Name', 'Description', 'Landowner ID', 'Landowner Name', 'Supervisor ID', 'Status'
+    'Location ID', 'Work Location Name', 'Description', 'Landowner ID', 'Landowner Name', 'Supervisor ID', 'Status',
+    'Latitude', 'Longitude', 'Radius Meters'
   ],
   ATTENDANCE: [
     'Attendance Record ID', 'Employee ID', 'Employee Name', 'Supervisor ID', 'Supervisor Name',
@@ -42,813 +74,1099 @@ const HEADERS = {
     'Time IN', 'Time OUT', 'Original Time IN', 'Original Time OUT', 'Adjusted By',
     'Adjustment Reason', 'Actual GPS IN', 'Actual GPS OUT', 'Device Timestamp',
     'Synchronization Date', 'Synchronization Status', 'Record Status',
-    'Attendance Type', 'Leave Type', 'Leave Remarks'
+    'Attendance Type', 'Leave Type', 'Leave Remarks',
+    'Photo IN', 'Photo OUT', 'Distance IN Meters', 'Distance OUT Meters',
+    'Geofence IN', 'Geofence OUT', 'Hours Worked', 'Overtime Hours', 'Clock Flag', 'Device Timestamp OUT'
   ],
   AUDIT_LOGS: [
     'Log ID', 'User ID', 'User Role', 'Action', 'Record ID',
     'Previous Value', 'New Value', 'Reason', 'Date and Time'
   ],
   USERS: [
-    'User ID', 'Username', 'Password Hash', 'Role', 'Linked Supervisor ID', 'Account Status', 'Last Login'
+    'User ID', 'Username', 'Password Hash', 'Role', 'Linked Supervisor ID', 'Account Status', 'Last Login',
+    'Salt', 'Must Change Password'
+  ],
+  PROFILE_PHOTOS: [
+    'Photo Key', 'Type', 'Owner ID', 'Image', 'Updated At', 'Updated By'
   ]
 };
 
-/**
- * Handle HTTP GET Requests (Health check and direct browser access)
- */
+// Columns that hold numbers (everything else is written as plain text)
+var NUMERIC_COLUMNS = {
+  'Latitude': '0.000000', 'Longitude': '0.000000', 'Radius Meters': '0',
+  'Distance IN Meters': '0', 'Distance OUT Meters': '0',
+  'Hours Worked': '0.00', 'Overtime Hours': '0.00'
+};
+
+var PUBLIC_ACTIONS = { PING: true, SETUP_DB: true, LOGIN: true };
+var ADMIN_ACTIONS = {
+  SAVE_EMPLOYEE: true, SAVE_SUPERVISOR: true, SAVE_LANDOWNER: true, SAVE_LOCATION: true,
+  SAVE_USER: true, GET_AUDIT_LOGS: true, SAVE_APP_SETTINGS: true
+};
+var WRITE_ACTIONS = {
+  LOGIN: true, SYNC_ATTENDANCE_BATCH: true, UPLOAD_PHOTOS: true, SAVE_EMPLOYEE: true,
+  SAVE_SUPERVISOR: true, SAVE_LANDOWNER: true, SAVE_LOCATION: true, SAVE_USER: true,
+  SOFT_DELETE_ATTENDANCE: true, CHANGE_PASSWORD: true, SAVE_APP_SETTINGS: true, SAVE_PROFILE_PHOTO: true
+};
+var MAX_PROFILE_IMAGE_CHARS = 48000; // small JPEG (about 240 x 240) stored as text in one cell
+
+/* ==========================================================================
+   ENTRY POINTS
+   ========================================================================== */
+
 function doGet(e) {
-  setupDatabase();
-  return ContentService.createTextOutput(JSON.stringify({
+  return respondJSON({
     success: true,
-    message: 'Attendance System Google Apps Script API is active and operational.',
-    timestamp: new Date().toISOString()
-  })).setMimeType(ContentService.MimeType.JSON);
+    message: 'CocoTrack Attendance API is running.',
+    version: APP_VERSION,
+    serverTime: new Date().toISOString()
+  });
 }
 
-/**
- * Handle HTTP POST Requests from Web App
- */
 function doPost(e) {
-  var lock = LockService.getScriptLock();
+  var payload;
   try {
-    lock.waitLock(30000); // 30-second concurrency lock
-  } catch (lockError) {
-    return respondJSON({ success: false, error: 'Server busy, please retry in a moment.' });
+    if (!e || !e.postData || !e.postData.contents) return fail('Missing request body.', 'VALIDATION');
+    payload = JSON.parse(e.postData.contents);
+  } catch (parseErr) {
+    return fail('Request body is not valid JSON.', 'VALIDATION');
   }
 
-  try {
-    setupDatabase(); // Ensure all sheets & headers exist
+  var action = payload.action;
+  var lock = null;
 
-    if (!e || !e.postData || !e.postData.contents) {
-      return respondJSON({ success: false, error: 'Missing request body.' });
+  try {
+    if (WRITE_ACTIONS[action]) {
+      lock = LockService.getScriptLock();
+      if (!lock.tryLock(30000)) return fail('Server busy, please retry in a moment.', 'BUSY');
     }
 
-    var payload = JSON.parse(e.postData.contents);
-    var action = payload.action;
+    ensureDatabase();
+
+    if (action === 'PING' || action === 'SETUP_DB') {
+      return respondJSON({ success: true, message: 'Connected. Database is ready.', version: APP_VERSION, serverTime: new Date().toISOString() });
+    }
+    if (action === 'LOGIN') return handleLogin(payload);
+
+    var session = requireSession(payload.token);
+    if (ADMIN_ACTIONS[action] && session.role !== 'Admin') {
+      return fail('Only administrators can do this.', 'FORBIDDEN');
+    }
 
     switch (action) {
-      case 'SETUP_DB':
-        return respondJSON({ success: true, message: 'Database verified & initialized.' });
-
-      case 'LOGIN':
-        return handleLogin(payload);
-
-      case 'GET_INITIAL_DATA':
-        return handleGetInitialData(payload);
-
-      case 'SYNC_ATTENDANCE_BATCH':
-        return handleSyncAttendanceBatch(payload);
-
-      case 'SAVE_EMPLOYEE':
-        return handleSaveEmployee(payload);
-
-      case 'SAVE_SUPERVISOR':
-        return handleSaveSupervisor(payload);
-
-      case 'SAVE_LANDOWNER':
-        return handleSaveLandowner(payload);
-
-      case 'SAVE_LOCATION':
-        return handleSaveLocation(payload);
-
-      case 'SAVE_USER':
-        return handleSaveUser(payload);
-
-      case 'SOFT_DELETE_ATTENDANCE':
-        return handleSoftDeleteAttendance(payload);
-
-      case 'GET_AUDIT_LOGS':
-        return handleGetAuditLogs();
-
-      default:
-        return respondJSON({ success: false, error: 'Unknown action: ' + action });
+      case 'LOGOUT': return handleLogout(payload);
+      case 'CHANGE_PASSWORD': return handleChangePassword(session, payload);
+      case 'GET_INITIAL_DATA': return handleGetInitialData(session, payload);
+      case 'GET_ATTENDANCE_RANGE': return handleGetAttendanceRange(session, payload);
+      case 'SYNC_ATTENDANCE_BATCH': return handleSyncAttendanceBatch(session, payload);
+      case 'UPLOAD_PHOTOS': return handleUploadPhotos(session, payload);
+      case 'GET_PHOTO': return handleGetPhoto(session, payload);
+      case 'SAVE_EMPLOYEE': return handleSaveEmployee(session, payload);
+      case 'SAVE_SUPERVISOR': return handleSaveSupervisor(session, payload);
+      case 'SAVE_LANDOWNER': return handleSaveLandowner(session, payload);
+      case 'SAVE_LOCATION': return handleSaveLocation(session, payload);
+      case 'SAVE_USER': return handleSaveUser(session, payload);
+      case 'SAVE_APP_SETTINGS': return handleSaveAppSettings(session, payload);
+      case 'SOFT_DELETE_ATTENDANCE': return handleSoftDeleteAttendance(session, payload);
+      case 'GET_AUDIT_LOGS': return handleGetAuditLogs(session, payload);
+      case 'SAVE_PROFILE_PHOTO': return handleSaveProfilePhoto(session, payload);
+      case 'GET_PROFILE_PHOTOS': return handleGetProfilePhotos(session, payload);
+      default: return fail('Unknown action: ' + action, 'VALIDATION');
     }
   } catch (err) {
-    return respondJSON({ success: false, error: err.toString() });
+    if (err && err.code) return fail(err.message, err.code);
+    console.error(err);
+    return fail(String(err), 'SERVER');
   } finally {
-    lock.releaseLock();
+    if (lock) { try { lock.releaseLock(); } catch (x) {} }
   }
 }
 
-/**
- * Helper to respond with JSON & CORS
- */
 function respondJSON(obj) {
-  return ContentService.createTextOutput(JSON.stringify(obj))
-    .setMimeType(ContentService.MimeType.JSON);
+  return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
 }
 
-/**
- * Setup Database: Creates missing sheets and sets headers with styling
- */
+function fail(message, code) {
+  return respondJSON({ success: false, error: message, code: code || 'SERVER' });
+}
+
+function AppError(message, code) {
+  var e = new Error(message);
+  e.code = code;
+  return e;
+}
+
+/* ==========================================================================
+   DATABASE SETUP & MIGRATION
+   ========================================================================== */
+
+function ensureDatabase() {
+  var props = PropertiesService.getScriptProperties();
+  if (props.getProperty('DB_VERSION') === DB_VERSION) return;
+  setupDatabase();
+  props.setProperty('DB_VERSION', DB_VERSION);
+}
+
+/** Run this once from the editor if you ever want to force a re-check of all sheets. */
 function setupDatabase() {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
 
   for (var key in SHEET_NAMES) {
-    var sheetName = SHEET_NAMES[key];
-    var sheet = ss.getSheetByName(sheetName);
+    var sheet = ss.getSheetByName(SHEET_NAMES[key]);
     var headers = HEADERS[key];
+    if (!sheet) sheet = ss.insertSheet(SHEET_NAMES[key]);
 
-    if (!sheet) {
-      sheet = ss.insertSheet(sheetName);
-    }
-
-    if (sheet.getLastRow() === 0) {
-      sheet.appendRow(headers);
-      var headerRange = sheet.getRange(1, 1, 1, headers.length);
-      headerRange.setBackground('#15803d'); // Deep Emerald Green
-      headerRange.setFontColor('#ffffff');
-      headerRange.setFontWeight('bold');
-      sheet.setFrozenRows(1);
-
-      // Auto-resize columns
-      for (var col = 1; col <= headers.length; col++) {
-        sheet.setColumnWidth(col, 160);
+    // Add any header that is missing (new columns are appended; existing data is untouched)
+    var width = Math.max(sheet.getLastColumn(), headers.length);
+    var current = sheet.getLastRow() === 0 ? [] : sheet.getRange(1, 1, 1, width).getValues()[0];
+    for (var h = 0; h < headers.length; h++) {
+      if (!current[h]) {
+        var cell = sheet.getRange(1, h + 1);
+        cell.setValue(headers[h]).setBackground('#15803d').setFontColor('#ffffff').setFontWeight('bold');
+        sheet.setColumnWidth(h + 1, 160);
       }
     }
+    sheet.setFrozenRows(1);
   }
 
-  // MIGRATION: add any new Attendance columns (Attendance Type, Leave Type, Leave Remarks)
-  // to an existing sheet without touching the existing data.
-  var attSheet = ss.getSheetByName(SHEET_NAMES.ATTENDANCE);
-  var neededHeaders = HEADERS.ATTENDANCE;
-  var currentHeaders = attSheet.getRange(1, 1, 1, Math.max(attSheet.getLastColumn(), neededHeaders.length)).getValues()[0];
-  for (var h = 0; h < neededHeaders.length; h++) {
-    if (!currentHeaders[h]) {
-      var hc = attSheet.getRange(1, h + 1);
-      hc.setValue(neededHeaders[h]);
-      hc.setBackground('#15803d');
-      hc.setFontColor('#ffffff');
-      hc.setFontWeight('bold');
-      attSheet.setColumnWidth(h + 1, 160);
-    }
+  // Passwords now live only in the Users sheet (salted). Clear copies in the Supervisors sheet.
+  var supSheet = ss.getSheetByName(SHEET_NAMES.SUPERVISORS);
+  if (supSheet.getLastRow() > 1) {
+    supSheet.getRange(2, 4, supSheet.getLastRow() - 1, 1).clearContent();
   }
 
-  // Ensure default Admin user exists in Users sheet
+  // Default admin (admin / admin123) - must change password at first login
   var userSheet = ss.getSheetByName(SHEET_NAMES.USERS);
   if (userSheet.getLastRow() <= 1) {
-    // SHA-256 for 'admin123' = '240be518fabd2724ddb6f04eeb1da5967448d7e831c08c8fa822809f74c720a9'
-    var defaultAdminHash = '240be518fabd2724ddb6f04eeb1da5967448d7e831c08c8fa822809f74c720a9';
-    userSheet.appendRow([
-      'USR-ADMIN-1',
-      'admin',
-      defaultAdminHash,
-      'Admin',
-      '',
-      'Active',
-      new Date().toISOString()
-    ]);
+    var salt = newSalt();
+    var clientHash = sha256Hex('admin123'); // same as what the app sends
+    writeRow(userSheet, 2, HEADERS.USERS, {
+      'User ID': 'USR-ADMIN-1', 'Username': 'admin', 'Password Hash': serverHash(salt, clientHash),
+      'Role': 'Admin', 'Linked Supervisor ID': '', 'Account Status': 'Active', 'Last Login': '',
+      'Salt': salt, 'Must Change Password': 'TRUE'
+    });
   }
 }
 
-/**
- * Login Handler
- */
-function handleLogin(payload) {
-  var username = (payload.username || '').trim().toLowerCase();
-  var passwordHash = (payload.passwordHash || '').trim();
+/* ==========================================================================
+   SHEET HELPERS
+   ========================================================================== */
 
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var userSheet = ss.getSheetByName(SHEET_NAMES.USERS);
-  var data = userSheet.getDataRange().getValues();
-
-  for (var i = 1; i < data.length; i++) {
-    var row = data[i];
-    var rowUsername = (row[1] || '').toString().trim().toLowerCase();
-    var rowHash = (row[2] || '').toString().trim();
-    var role = row[3];
-    var supervisorId = row[4];
-    var status = row[5];
-
-    if (rowUsername === username) {
-      if (rowHash !== passwordHash) {
-        return respondJSON({ success: false, error: 'Incorrect password.' });
-      }
-      if (status !== 'Active') {
-        return respondJSON({ success: false, error: 'Account is deactivated. Contact administrator.' });
-      }
-
-      // Update Last Login
-      userSheet.getRange(i + 1, 7).setValue(new Date().toISOString());
-
-      // Find supervisor name if applicable
-      var supervisorName = '';
-      if (supervisorId) {
-        var supSheet = ss.getSheetByName(SHEET_NAMES.SUPERVISORS);
-        var supData = supSheet.getDataRange().getValues();
-        for (var s = 1; s < supData.length; s++) {
-          if (supData[s][0].toString() === supervisorId.toString()) {
-            supervisorName = supData[s][1];
-            break;
-          }
-        }
-      }
-
-      return respondJSON({
-        success: true,
-        user: {
-          userId: row[0],
-          username: row[1],
-          role: role,
-          linkedSupervisorId: supervisorId,
-          name: supervisorName || row[1],
-          accountStatus: status
-        }
-      });
-    }
-  }
-
-  return respondJSON({ success: false, error: 'User account not found.' });
+function getSheet(name) {
+  return SpreadsheetApp.getActiveSpreadsheet().getSheetByName(name);
 }
 
-/**
- * Get Initial Data with Strict Role Scoping
- */
-function handleGetInitialData(payload) {
-  var role = payload.role || 'Admin';
-  var supervisorId = (payload.supervisorId || '').toString().trim();
+function headerIndex(headers) {
+  var map = {};
+  for (var i = 0; i < headers.length; i++) map[headers[i]] = i;
+  return map;
+}
 
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-
-  // Helper to read all rows as objects
-  function getSheetObjects(sheetName) {
-    var sheet = ss.getSheetByName(sheetName);
-    if (!sheet || sheet.getLastRow() <= 1) return [];
-    var range = sheet.getDataRange();
-    var data = range.getValues();
-    var display = range.getDisplayValues();
-    var headers = data[0];
-    var rows = [];
-    for (var r = 1; r < data.length; r++) {
-      var row = data[r];
-      var obj = {};
-      for (var c = 0; c < headers.length; c++) {
-        var key = toCamelCase(headers[c]);
-        obj[key] = normalizeCell(key, row[c], display[r][c]);
-      }
-      rows.push(obj);
-    }
-    return rows;
-  }
-
-  var allEmployees = getSheetObjects(SHEET_NAMES.EMPLOYEES);
-  var allSupervisors = getSheetObjects(SHEET_NAMES.SUPERVISORS);
-  var allLandowners = getSheetObjects(SHEET_NAMES.LANDOWNERS);
-  var allLocations = getSheetObjects(SHEET_NAMES.LOCATIONS);
-  var allAttendance = getSheetObjects(SHEET_NAMES.ATTENDANCE);
-  var allUsers = role === 'Admin' ? getSheetObjects(SHEET_NAMES.USERS) : [];
-
-  var filteredEmployees = allEmployees;
-  var filteredLandowners = allLandowners;
-  var filteredLocations = allLocations;
-  var filteredAttendance = allAttendance;
-
-  // STRICT SUPERVISOR SCOPING:
-  // If user is a Supervisor, ONLY return their assigned employees, locations, landowners, and attendance!
-  if (role === 'Supervisor' && supervisorId) {
-    filteredEmployees = allEmployees.filter(function(e) {
-      return (e.supervisorId || '').toString() === supervisorId;
-    });
-
-    filteredLocations = allLocations.filter(function(loc) {
-      return (loc.supervisorId || '').toString() === supervisorId;
-    });
-
-    // LANDOWNER RULE: a supervisor only receives landowners registered under the
-    // Work Location(s) assigned to that supervisor (matched by Location ID, or by the
-    // Landowner ID listed on the supervisor's location).
-    var myLocIds = {};
-    var myLocLandownerIds = {};
-    filteredLocations.forEach(function(loc) {
-      if ((loc.status || 'Active') === 'Active') {
-        myLocIds[(loc.locationId || '').toString()] = true;
-        if (loc.landownerId) myLocLandownerIds[loc.landownerId.toString()] = true;
-      }
-    });
-    filteredLandowners = allLandowners.filter(function(l) {
-      if ((l.status || 'Active') !== 'Active') return false;
-      return !!myLocIds[(l.locationId || '').toString()] || !!myLocLandownerIds[(l.landownerId || '').toString()];
-    });
-
-    filteredAttendance = allAttendance.filter(function(a) {
-      return (a.supervisorId || '').toString() === supervisorId;
-    });
-  }
-
-  return respondJSON({
-    success: true,
-    data: {
-      employees: filteredEmployees,
-      supervisors: allSupervisors,
-      landowners: filteredLandowners,
-      locations: filteredLocations,
-      attendance: filteredAttendance,
-      users: allUsers
-    }
+/** Builds a row array (in header order) from an object keyed by header name. */
+function buildRow(headers, obj) {
+  return headers.map(function (h) {
+    var v = obj[h];
+    if (v === undefined || v === null) return '';
+    if (NUMERIC_COLUMNS[h]) return (v === '' || isNaN(Number(v))) ? '' : Number(v);
+    return String(v);
   });
 }
 
+function rowFormats(headers) {
+  return headers.map(function (h) { return NUMERIC_COLUMNS[h] || '@'; });
+}
+
+/** Writes one row, formatting text cells as text FIRST so "0001" stays "0001". */
+function writeRow(sheet, rowIndex, headers, obj) {
+  var range = sheet.getRange(rowIndex, 1, 1, headers.length);
+  range.setNumberFormats([rowFormats(headers)]);
+  range.setValues([buildRow(headers, obj)]);
+}
+
+function writeRows(sheet, startRow, headers, objs) {
+  if (!objs.length) return;
+  var range = sheet.getRange(startRow, 1, objs.length, headers.length);
+  var fmt = rowFormats(headers);
+  range.setNumberFormats(objs.map(function () { return fmt; }));
+  range.setValues(objs.map(function (o) { return buildRow(headers, o); }));
+}
+
+/** Reads a sheet into objects keyed by header NAME (raw) plus row number. */
+function readRowsByHeader(sheetName, headers) {
+  var sheet = getSheet(sheetName);
+  var last = sheet.getLastRow();
+  if (last <= 1) return [];
+  var range = sheet.getRange(2, 1, last - 1, headers.length);
+  var values = range.getValues();
+  var display = range.getDisplayValues();
+  var out = [];
+  for (var r = 0; r < values.length; r++) {
+    var o = { _row: r + 2 };
+    for (var c = 0; c < headers.length; c++) {
+      o[headers[c]] = normalizeCell(toCamelCase(headers[c]), values[r][c], display[r][c]);
+    }
+    out.push(o);
+  }
+  return out;
+}
+
+/** Converts header-keyed objects to camelCase objects for the app. */
+function toApp(rowObj, headers, omit) {
+  var o = {};
+  headers.forEach(function (h) {
+    if (omit && omit[h]) return;
+    o[toCamelCase(h)] = rowObj[h] === undefined ? '' : rowObj[h];
+  });
+  return o;
+}
+
+function fromApp(appObj, headers) {
+  var o = {};
+  headers.forEach(function (h) {
+    var k = toCamelCase(h);
+    if (appObj[k] !== undefined) o[h] = appObj[k];
+  });
+  return o;
+}
+
 /**
- * Google Sheets silently converts text such as "2026-10-26", "07:01 AM" or "0001"
- * into Date / number values. Convert them back so the app always receives
- * plain strings (yyyy-MM-dd dates, "hh:mm AM" times, text IDs).
+ * Google Sheets turns "2026-10-26", "07:01 AM" or "0001" into dates/numbers.
+ * Convert them back so the app always receives plain strings.
  */
 function normalizeCell(key, v, displayValue) {
   if (v instanceof Date) {
     var tz = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
-    if (key === 'attendanceDate' || key === 'dateEnrolled') {
-      return Utilities.formatDate(v, tz, 'yyyy-MM-dd');
-    }
+    if (key === 'attendanceDate' || key === 'dateEnrolled') return Utilities.formatDate(v, tz, 'yyyy-MM-dd');
     if (/^(time|originalTime)/.test(key)) {
       return (displayValue || '').replace(/(\d{1,2}:\d{2}):\d{2}(\s*[AaPp][Mm])/, '$1$2').replace(/^(\d):/, '0$1:');
     }
     return v.toISOString();
   }
-  if (typeof v === 'number' && /Id$/.test(key)) {
-    return String(v);
-  }
+  if (typeof v === 'number' && /Id$/.test(key)) return String(v);
   return v;
 }
 
-/**
- * Synchronize Attendance Batch: Upsert logic to prevent duplicate records
- */
-function handleSyncAttendanceBatch(payload) {
-  var records = payload.records || [];
-  var userId = payload.userId || 'SYSTEM';
-  var userRole = payload.userRole || 'Supervisor';
+function toCamelCase(str) {
+  return String(str).toLowerCase().replace(/[^a-zA-Z0-9]+(.)/g, function (m, chr) { return chr.toUpperCase(); });
+}
 
-  if (!records || records.length === 0) {
-    return respondJSON({ success: true, syncedIds: [], message: 'No records to sync.' });
+/* ==========================================================================
+   PASSWORDS & SESSIONS
+   ========================================================================== */
+
+function bytesToHex(bytes) {
+  return bytes.map(function (b) { var x = (b < 0 ? b + 256 : b).toString(16); return x.length === 1 ? '0' + x : x; }).join('');
+}
+
+function sha256Hex(str) {
+  return bytesToHex(Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, str, Utilities.Charset.UTF_8));
+}
+
+function newSalt() {
+  return sha256Hex(Utilities.getUuid() + Math.random() + Date.now()).substring(0, 32);
+}
+
+/** clientHash = SHA-256(password) computed by the phone. We salt + stretch it before storing. */
+function serverHash(salt, clientHash) {
+  var h = salt + ':' + clientHash;
+  for (var i = 0; i < HASH_ITERATIONS; i++) h = sha256Hex(salt + h);
+  return h;
+}
+
+function safeEquals(a, b) {
+  a = String(a || ''); b = String(b || '');
+  if (a.length !== b.length) return false;
+  var diff = 0;
+  for (var i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+/** Returns true if clientHash matches. Upgrades legacy unsalted hashes in place. */
+function verifyPassword(userRow, clientHash) {
+  var sheet = getSheet(SHEET_NAMES.USERS);
+  var salt = String(userRow['Salt'] || '');
+  var stored = String(userRow['Password Hash'] || '');
+  if (!clientHash || !stored) return false;
+
+  if (!salt) {
+    // Legacy v2 account: the stored value is the plain SHA-256 of the password.
+    if (!safeEquals(stored, clientHash)) return false;
+    var s = newSalt();
+    userRow['Salt'] = s;
+    userRow['Password Hash'] = serverHash(s, clientHash);
+    writeRow(sheet, userRow._row, HEADERS.USERS, userRow);
+    return true;
   }
+  return safeEquals(stored, serverHash(salt, clientHash));
+}
 
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var sheet = ss.getSheetByName(SHEET_NAMES.ATTENDANCE);
-  var data = sheet.getDataRange().getValues();
+function setPassword(userRow, clientHash, mustChange) {
+  var s = newSalt();
+  userRow['Salt'] = s;
+  userRow['Password Hash'] = serverHash(s, clientHash);
+  userRow['Must Change Password'] = mustChange ? 'TRUE' : 'FALSE';
+}
 
-  // Map existing Attendance Record IDs to their row indices (1-indexed for Sheet)
-  var recordMap = {};
-  for (var i = 1; i < data.length; i++) {
-    var recId = data[i][0].toString();
-    recordMap[recId] = i + 1;
+function findUserBy(field, value) {
+  var users = readRowsByHeader(SHEET_NAMES.USERS, HEADERS.USERS);
+  var v = String(value || '').trim().toLowerCase();
+  for (var i = 0; i < users.length; i++) {
+    if (String(users[i][field] || '').trim().toLowerCase() === v) return users[i];
   }
+  return null;
+}
 
-  var syncedIds = [];
-  var now = new Date().toISOString();
-  var nextRow = sheet.getLastRow() + 1;
+function createSession(userId) {
+  var token = (Utilities.getUuid() + Utilities.getUuid()).replace(/-/g, '');
+  var exp = Date.now() + SESSION_DAYS * 86400000;
+  PropertiesService.getScriptProperties().setProperty('S_' + sha256Hex(token), JSON.stringify({ u: userId, exp: exp }));
+  return { token: token, expiresAt: new Date(exp).toISOString() };
+}
 
-  records.forEach(function(rec) {
-    var recId = rec.attendanceRecordId;
-    var rowValues = [
-      rec.attendanceRecordId,
-      rec.employeeId,
-      rec.employeeName,
-      rec.supervisorId,
-      rec.supervisorName,
-      rec.landownerId || '',
-      rec.landownerName || '',
-      rec.locationId || '',
-      rec.workLocation || '',
-      rec.attendanceDate,
-      rec.timeIn || '',
-      rec.timeOut || '',
-      rec.originalTimeIn || '',
-      rec.originalTimeOut || '',
-      rec.adjustedBy || '',
-      rec.adjustmentReason || '',
-      rec.actualGpsIn || '',
-      rec.actualGpsOut || '',
-      rec.deviceTimestamp || now,
-      now, // Synchronization Date
-      'SYNCED',
-      rec.recordStatus || 'ACTIVE',
-      rec.attendanceType || 'PRESENT',
-      rec.leaveType || '',
-      rec.leaveRemarks || ''
-    ];
-
-    var isLeave = (rec.attendanceType || '').toUpperCase() === 'LEAVE';
-
-    if (recordMap[recId]) {
-      // Record already exists: Update existing row (Preserves ID & avoids duplicates)
-      var rowIndex = recordMap[recId];
-      var rowRange = sheet.getRange(rowIndex, 1, 1, rowValues.length);
-      rowRange.setNumberFormat('@'); // plain text: keeps dates, times and IDs like 0001 exactly as sent
-      rowRange.setValues([rowValues]);
-
-      if (isLeave && rec.recordStatus === 'DELETED') {
-        logAudit(userId, userRole, 'CANCEL_LEAVE', recId, (rec.leaveType || 'Leave') + ' ' + rec.attendanceDate, 'DELETED', rec.employeeName);
-      } else if (rec.adjustmentReason) {
-        logAudit(userId, userRole, 'UPDATE_ATTENDANCE', recId, 'Previous Record', JSON.stringify(rec), rec.adjustmentReason);
-      }
-    } else {
-      // New record: write into the next empty row as plain text
-      var newRange = sheet.getRange(nextRow, 1, 1, rowValues.length);
-      newRange.setNumberFormat('@');
-      newRange.setValues([rowValues]);
-      recordMap[recId] = nextRow;
-      nextRow++;
-
-      if (isLeave) {
-        logAudit(userId, userRole, 'RECORD_LEAVE', recId, '', (rec.leaveType || 'Leave') + ' - ' + rec.employeeName + ' - ' + rec.attendanceDate, rec.leaveRemarks || '');
-      }
-    }
-
-    syncedIds.push(recId);
+function cleanupSessions() {
+  var props = PropertiesService.getScriptProperties();
+  var all = props.getProperties();
+  var now = Date.now();
+  Object.keys(all).forEach(function (k) {
+    if (k.indexOf('S_') !== 0) return;
+    try { if (JSON.parse(all[k]).exp < now) props.deleteProperty(k); } catch (e) { props.deleteProperty(k); }
   });
+}
+
+/** Validates the token and returns the CURRENT user details from the Users sheet. */
+function requireSession(token) {
+  if (!token) throw AppError('Please log in again (no session).', 'AUTH_REQUIRED');
+  var props = PropertiesService.getScriptProperties();
+  var key = 'S_' + sha256Hex(String(token));
+  var raw = props.getProperty(key);
+  if (!raw) throw AppError('Your session has ended. Please log in again while online.', 'AUTH_REQUIRED');
+  var s = JSON.parse(raw);
+  if (s.exp < Date.now()) {
+    props.deleteProperty(key);
+    throw AppError('Your session expired. Please log in again while online.', 'AUTH_EXPIRED');
+  }
+  var user = findUserBy('User ID', s.u);
+  if (!user) { props.deleteProperty(key); throw AppError('Account no longer exists.', 'AUTH_REQUIRED'); }
+  if (user['Account Status'] !== 'Active') {
+    props.deleteProperty(key);
+    throw AppError('Account is deactivated. Contact administrator.', 'ACCOUNT_DISABLED');
+  }
+  return {
+    key: key,
+    userId: String(user['User ID']),
+    username: String(user['Username']),
+    role: String(user['Role'] || 'Supervisor'),
+    supervisorId: String(user['Linked Supervisor ID'] || ''),
+    mustChangePassword: String(user['Must Change Password']).toUpperCase() === 'TRUE'
+  };
+}
+
+function getSupervisorName(supervisorId) {
+  if (!supervisorId) return '';
+  var sups = readRowsByHeader(SHEET_NAMES.SUPERVISORS, HEADERS.SUPERVISORS);
+  for (var i = 0; i < sups.length; i++) {
+    if (String(sups[i]['Supervisor ID']) === String(supervisorId)) return String(sups[i]['Supervisor Name']);
+  }
+  return '';
+}
+
+/* ==========================================================================
+   SETTINGS
+   ========================================================================== */
+
+function getAppSettings() {
+  var raw = PropertiesService.getScriptProperties().getProperty('APP_SETTINGS');
+  var saved = {};
+  try { saved = raw ? JSON.parse(raw) : {}; } catch (e) {}
+  var out = {};
+  for (var k in DEFAULT_SETTINGS) out[k] = saved[k] !== undefined ? saved[k] : DEFAULT_SETTINGS[k];
+  return out;
+}
+
+function handleSaveAppSettings(session, payload) {
+  var incoming = payload.settings || {};
+  var cur = getAppSettings();
+  var enums = { photoMode: ['required', 'optional', 'off'], geofenceMode: ['off', 'warn', 'block'] };
+  var ranges = {
+    defaultRadiusMeters: [10, 20000], maxGpsAccuracyMeters: [5, 5000], regularHours: [1, 24],
+    breakMinutes: [0, 240], breakAfterHours: [0, 24], restDay: [-1, 6], attendanceDays: [7, 366],
+    offlineLoginDays: [1, 90], maxClockDriftMinutes: [1, 120], lateGraceMinutes: [0, 120]
+  };
+  Object.keys(incoming).forEach(function (k) {
+    if (k === 'workStartTime') {
+      var mins = parseTimeToMinutes(incoming[k]);
+      if (mins === null) throw AppError('Invalid work start time.', 'VALIDATION');
+      cur[k] = String(incoming[k]).trim().toUpperCase();
+    } else if (enums[k]) {
+      if (enums[k].indexOf(incoming[k]) === -1) throw AppError('Invalid value for ' + k, 'VALIDATION');
+      cur[k] = incoming[k];
+    } else if (ranges[k]) {
+      var n = Number(incoming[k]);
+      if (isNaN(n) || n < ranges[k][0] || n > ranges[k][1]) throw AppError('Invalid value for ' + k, 'VALIDATION');
+      cur[k] = n;
+    }
+  });
+  PropertiesService.getScriptProperties().setProperty('APP_SETTINGS', JSON.stringify(cur));
+  logAudits([auditEntry(session, 'UPDATE_SETTINGS', 'APP_SETTINGS', '', JSON.stringify(cur), 'System settings updated')]);
+  return respondJSON({ success: true, settings: cur });
+}
+
+/* ==========================================================================
+   AUTH HANDLERS
+   ========================================================================== */
+
+function handleLogin(payload) {
+  var username = String(payload.username || '').trim();
+  var clientHash = String(payload.passwordHash || '').trim();
+  if (!username || !clientHash) return fail('Invalid username or password.', 'INVALID_CREDENTIALS');
+
+  var user = findUserBy('Username', username);
+  if (!user || !verifyPassword(user, clientHash)) {
+    return fail('Invalid username or password.', 'INVALID_CREDENTIALS');
+  }
+  if (user['Account Status'] !== 'Active') {
+    return fail('Account is deactivated. Contact administrator.', 'ACCOUNT_DISABLED');
+  }
+
+  user['Last Login'] = new Date().toISOString();
+  writeRow(getSheet(SHEET_NAMES.USERS), user._row, HEADERS.USERS, user);
+
+  if (Math.random() < 0.2) cleanupSessions();
+  var sess = createSession(String(user['User ID']));
+  var supId = String(user['Linked Supervisor ID'] || '');
 
   return respondJSON({
     success: true,
-    syncedIds: syncedIds,
-    count: syncedIds.length
+    token: sess.token,
+    tokenExpiresAt: sess.expiresAt,
+    serverTime: new Date().toISOString(),
+    settings: getAppSettings(),
+    user: {
+      userId: String(user['User ID']),
+      username: String(user['Username']),
+      role: String(user['Role']),
+      linkedSupervisorId: supId,
+      name: getSupervisorName(supId) || String(user['Username']),
+      accountStatus: 'Active',
+      mustChangePassword: String(user['Must Change Password']).toUpperCase() === 'TRUE'
+    }
   });
 }
 
-/**
- * Save / Update Employee (Manual Employee ID strictly required and unique)
- */
-function handleSaveEmployee(payload) {
-  var emp = payload.employee;
-  var userId = payload.userId || 'ADMIN';
-  var userRole = payload.userRole || 'Admin';
+function handleLogout(payload) {
+  try {
+    PropertiesService.getScriptProperties().deleteProperty('S_' + sha256Hex(String(payload.token)));
+  } catch (e) {}
+  return respondJSON({ success: true });
+}
 
-  if (!emp || !emp.employeeId || !emp.employeeName) {
-    return respondJSON({ success: false, error: 'Employee ID and Full Name are mandatory.' });
+function handleChangePassword(session, payload) {
+  var cur = String(payload.currentPasswordHash || '');
+  var next = String(payload.newPasswordHash || '');
+  if (!/^[a-f0-9]{64}$/.test(next)) return fail('Invalid new password.', 'VALIDATION');
+  var user = findUserBy('User ID', session.userId);
+  if (!verifyPassword(user, cur)) return fail('Current password is incorrect.', 'INVALID_CREDENTIALS');
+  if (safeEquals(cur, next)) return fail('New password must be different from the current one.', 'VALIDATION');
+  user = findUserBy('User ID', session.userId); // re-read (verifyPassword may have upgraded it)
+  setPassword(user, next, false);
+  writeRow(getSheet(SHEET_NAMES.USERS), user._row, HEADERS.USERS, user);
+  logAudits([auditEntry(session, 'CHANGE_PASSWORD', session.username, '', '', 'User changed own password')]);
+  return respondJSON({ success: true });
+}
+
+/* ==========================================================================
+   DATA DOWNLOAD
+   ========================================================================== */
+
+function dateDaysAgo(days) {
+  var tz = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
+  return Utilities.formatDate(new Date(Date.now() - days * 86400000), tz, 'yyyy-MM-dd');
+}
+
+function scopeAttendance(session, rows) {
+  if (session.role === 'Admin') return rows;
+  return rows.filter(function (a) { return String(a['Supervisor ID'] || '') === session.supervisorId; });
+}
+
+function handleGetInitialData(session, payload) {
+  var settings = getAppSettings();
+  var H = HEADERS;
+
+  var employees = readRowsByHeader(SHEET_NAMES.EMPLOYEES, H.EMPLOYEES);
+  var supervisors = readRowsByHeader(SHEET_NAMES.SUPERVISORS, H.SUPERVISORS);
+  var landowners = readRowsByHeader(SHEET_NAMES.LANDOWNERS, H.LANDOWNERS);
+  var locations = readRowsByHeader(SHEET_NAMES.LOCATIONS, H.LOCATIONS);
+  var fromDate = dateDaysAgo(Number(settings.attendanceDays) || 60);
+  var attendance = readRowsByHeader(SHEET_NAMES.ATTENDANCE, H.ATTENDANCE).filter(function (a) {
+    return String(a['Attendance Date'] || '') >= fromDate;
+  });
+  var users = session.role === 'Admin' ? readRowsByHeader(SHEET_NAMES.USERS, H.USERS) : [];
+
+  if (session.role !== 'Admin') {
+    var sid = session.supervisorId;
+    employees = employees.filter(function (e) { return String(e['Supervisor ID'] || '') === sid; });
+    locations = locations.filter(function (l) { return String(l['Supervisor ID'] || '') === sid; });
+    var myLocIds = {}, myLocLandownerIds = {};
+    locations.forEach(function (loc) {
+      if ((loc['Status'] || 'Active') === 'Active') {
+        myLocIds[String(loc['Location ID'])] = true;
+        if (loc['Landowner ID']) myLocLandownerIds[String(loc['Landowner ID'])] = true;
+      }
+    });
+    landowners = landowners.filter(function (l) {
+      if ((l['Status'] || 'Active') !== 'Active') return false;
+      return !!myLocIds[String(l['Location ID'] || '')] || !!myLocLandownerIds[String(l['Landowner ID'] || '')];
+    });
+    supervisors = supervisors.filter(function (s) { return String(s['Supervisor ID']) === sid; });
+    attendance = scopeAttendance(session, attendance);
   }
 
-  var empId = emp.employeeId.toString().trim();
-  var isEdit = payload.isEdit === true;
-
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var sheet = ss.getSheetByName(SHEET_NAMES.EMPLOYEES);
-  var data = sheet.getDataRange().getValues();
-
-  var foundRow = -1;
-  for (var i = 1; i < data.length; i++) {
-    if (data[i][0].toString().trim().toLowerCase() === empId.toLowerCase()) {
-      foundRow = i + 1;
-      break;
+  return respondJSON({
+    success: true,
+    serverTime: new Date().toISOString(),
+    settings: settings,
+    attendanceFrom: fromDate,
+    me: { role: session.role, linkedSupervisorId: session.supervisorId, mustChangePassword: session.mustChangePassword },
+    data: {
+      employees: employees.map(function (r) { return toApp(r, H.EMPLOYEES); }),
+      supervisors: supervisors.map(function (r) { return toApp(r, H.SUPERVISORS, { 'Password Hash': true }); }),
+      landowners: landowners.map(function (r) { return toApp(r, H.LANDOWNERS); }),
+      locations: locations.map(function (r) { return toApp(r, H.LOCATIONS); }),
+      attendance: attendance.map(function (r) { return toApp(r, H.ATTENDANCE); }),
+      users: users.map(function (r) { return toApp(r, H.USERS, { 'Password Hash': true, 'Salt': true }); })
     }
+  });
+}
+
+function handleGetAttendanceRange(session, payload) {
+  var from = String(payload.from || ''), to = String(payload.to || '');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to)) return fail('Invalid date range.', 'VALIDATION');
+  var rows = readRowsByHeader(SHEET_NAMES.ATTENDANCE, HEADERS.ATTENDANCE).filter(function (a) {
+    var d = String(a['Attendance Date'] || '');
+    return d >= from && d <= to;
+  });
+  rows = scopeAttendance(session, rows);
+  return respondJSON({ success: true, attendance: rows.map(function (r) { return toApp(r, HEADERS.ATTENDANCE); }) });
+}
+
+/* ==========================================================================
+   ATTENDANCE SYNC
+   ========================================================================== */
+
+function parseTimeToMinutes(t) {
+  var m = String(t || '').trim().match(/^(\d{1,2}):(\d{2})\s*([AaPp][Mm])?$/);
+  if (!m) return null;
+  var h = Number(m[1]), min = Number(m[2]);
+  if (min > 59) return null;
+  if (m[3]) {
+    if (h < 1 || h > 12) return null;
+    var pm = m[3].toUpperCase() === 'PM';
+    if (h === 12) h = pm ? 12 : 0; else if (pm) h += 12;
+  } else if (h > 23) return null;
+  return h * 60 + min;
+}
+
+function computeHours(timeIn, timeOut, settings) {
+  var a = parseTimeToMinutes(timeIn), b = parseTimeToMinutes(timeOut);
+  if (a === null || b === null) return { hours: '', overtime: '' };
+  var diff = b - a;
+  if (diff < 0) diff += 1440; // overnight shift
+  if (diff >= Number(settings.breakAfterHours) * 60) diff -= Number(settings.breakMinutes) || 0;
+  if (diff < 0) diff = 0;
+  var hours = Math.round(diff / 60 * 100) / 100;
+  var ot = Math.max(0, Math.round((hours - Number(settings.regularHours)) * 100) / 100);
+  return { hours: hours, overtime: ot };
+}
+
+function parseGps(str) {
+  var m = String(str || '').match(/(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)(?:.*?±\s*(\d+(?:\.\d+)?))?/);
+  if (!m) return null;
+  return { lat: Number(m[1]), lng: Number(m[2]), acc: m[3] ? Number(m[3]) : null };
+}
+
+function distanceMeters(lat1, lng1, lat2, lng2) {
+  var R = 6371000, toRad = Math.PI / 180;
+  var dLat = (lat2 - lat1) * toRad, dLng = (lng2 - lng1) * toRad;
+  var a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+          Math.cos(lat1 * toRad) * Math.cos(lat2 * toRad) * Math.sin(dLng / 2) * Math.sin(dLng / 2);
+  return Math.round(R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
+}
+
+function geofenceCheck(gpsStr, loc, settings) {
+  if (!gpsStr) return { distance: '', status: '' };
+  var g = parseGps(gpsStr);
+  if (!g) return { distance: '', status: 'NO_GPS' };
+  if (!loc || loc['Latitude'] === '' || loc['Longitude'] === '' || loc['Latitude'] === undefined) {
+    return { distance: '', status: 'NO_LOCATION_COORDS' };
   }
+  var d = distanceMeters(g.lat, g.lng, Number(loc['Latitude']), Number(loc['Longitude']));
+  var radius = Number(loc['Radius Meters']) || Number(settings.defaultRadiusMeters) || 300;
+  var status = d <= radius ? 'INSIDE' : 'OUTSIDE';
+  if (g.acc !== null && g.acc > Number(settings.maxGpsAccuracyMeters)) status += '_LOW_ACCURACY';
+  return { distance: d, status: status };
+}
 
-  // Prevent duplicate Employee ID if adding new
-  if (!isEdit && foundRow !== -1) {
-    return respondJSON({ success: false, error: 'Employee ID "' + empId + '" already exists. Duplicate IDs are not allowed.' });
+function handleSyncAttendanceBatch(session, payload) {
+  var records = payload.records || [];
+  if (!records.length) return respondJSON({ success: true, syncedIds: [], rejected: [] });
+  if (records.length > MAX_SYNC_RECORDS) return fail('Too many records in one batch (max ' + MAX_SYNC_RECORDS + ').', 'VALIDATION');
+
+  var H = HEADERS.ATTENDANCE;
+  var settings = getAppSettings();
+  var sheet = getSheet(SHEET_NAMES.ATTENDANCE);
+  var existing = readRowsByHeader(SHEET_NAMES.ATTENDANCE, H);
+  var byId = {};
+  existing.forEach(function (r) { byId[String(r['Attendance Record ID'])] = r; });
+
+  var employees = {};
+  readRowsByHeader(SHEET_NAMES.EMPLOYEES, HEADERS.EMPLOYEES).forEach(function (e) { employees[String(e['Employee ID'])] = e; });
+  var locations = {};
+  readRowsByHeader(SHEET_NAMES.LOCATIONS, HEADERS.LOCATIONS).forEach(function (l) { locations[String(l['Location ID'])] = l; });
+
+  var isAdmin = session.role === 'Admin';
+  var now = new Date();
+  var nowIso = now.toISOString();
+  var syncedIds = [], rejected = [], newRows = [], audits = [];
+  var nextRow = Math.max(sheet.getLastRow(), 1) + 1;
+
+  records.forEach(function (rec) {
+    var id = String(rec.attendanceRecordId || '');
+    try {
+      if (!/^REC-[A-Za-z0-9-]{4,60}$/.test(id)) throw new Error('Invalid record ID.');
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(String(rec.attendanceDate || ''))) throw new Error('Invalid attendance date.');
+      if (rec.timeIn && parseTimeToMinutes(rec.timeIn) === null) throw new Error('Invalid Time IN format.');
+      if (rec.timeOut && parseTimeToMinutes(rec.timeOut) === null) throw new Error('Invalid Time OUT format.');
+
+      var prev = byId[id];
+      var emp = employees[String(rec.employeeId)];
+
+      if (!isAdmin) {
+        if (prev && String(prev['Supervisor ID']) !== session.supervisorId) throw new Error('This record belongs to another supervisor.');
+        if (!prev && (!emp || String(emp['Supervisor ID']) !== session.supervisorId)) throw new Error('Employee is not assigned to you.');
+      }
+      if (!prev && !emp) throw new Error('Employee ID not found.');
+
+      var obj = fromApp(rec, H);
+      if (!isAdmin) {
+        obj['Supervisor ID'] = prev ? prev['Supervisor ID'] : session.supervisorId;
+        obj['Supervisor Name'] = prev ? prev['Supervisor Name'] : (emp['Supervisor Name'] || rec.supervisorName || '');
+      }
+
+      // Keep server-owned values the phone does not know about
+      if (prev) {
+        ['Photo IN', 'Photo OUT'].forEach(function (k) { if (!obj[k]) obj[k] = prev[k]; });
+        if (!obj['Original Time IN']) obj['Original Time IN'] = prev['Original Time IN'];
+        if (!obj['Original Time OUT']) obj['Original Time OUT'] = prev['Original Time OUT'];
+      }
+
+      var loc = locations[String(obj['Location ID'] || '')];
+      var gIn = geofenceCheck(obj['Actual GPS IN'], loc, settings);
+      var gOut = geofenceCheck(obj['Actual GPS OUT'], loc, settings);
+      obj['Distance IN Meters'] = gIn.distance; obj['Geofence IN'] = gIn.status;
+      obj['Distance OUT Meters'] = gOut.distance; obj['Geofence OUT'] = gOut.status;
+
+      var hrs = computeHours(obj['Time IN'], obj['Time OUT'], settings);
+      obj['Hours Worked'] = hrs.hours; obj['Overtime Hours'] = hrs.overtime;
+
+      // Clock check: a device timestamp in the future means the phone clock is wrong
+      var flags = String(rec.clockFlag || '').split(',').filter(String);
+      var devTs = Date.parse(rec.deviceTimestamp || '');
+      var driftMs = Number(settings.maxClockDriftMinutes) * 60000;
+      if (!isNaN(devTs) && devTs - now.getTime() > driftMs && flags.indexOf('FUTURE_TIME') === -1) flags.push('FUTURE_TIME');
+      obj['Clock Flag'] = flags.join(',');
+
+      obj['Device Timestamp'] = obj['Device Timestamp'] || nowIso;
+      obj['Synchronization Date'] = nowIso;
+      obj['Synchronization Status'] = 'SYNCED';
+      obj['Record Status'] = obj['Record Status'] || 'ACTIVE';
+      obj['Attendance Type'] = obj['Attendance Type'] || 'PRESENT';
+
+      var isLeave = String(obj['Attendance Type']).toUpperCase() === 'LEAVE';
+
+      if (prev) {
+        var before = {
+          date: prev['Attendance Date'], timeIn: prev['Time IN'], timeOut: prev['Time OUT'],
+          landowner: prev['Landowner Name'], status: prev['Record Status']
+        };
+        var after = {
+          date: obj['Attendance Date'], timeIn: obj['Time IN'], timeOut: obj['Time OUT'],
+          landowner: obj['Landowner Name'], status: obj['Record Status']
+        };
+        writeRow(sheet, prev._row, H, obj);
+        obj._row = prev._row;
+        byId[id] = obj;
+
+        if (JSON.stringify(before) !== JSON.stringify(after)) {
+          if (after.status === 'DELETED' && before.status !== 'DELETED') {
+            audits.push(auditEntry(session, isLeave ? 'CANCEL_LEAVE' : 'SOFT_DELETE_ATTENDANCE', id, JSON.stringify(before), 'DELETED', rec.deleteReason || rec.employeeName || ''));
+          } else if (rec.adjustmentReason && (before.timeIn !== after.timeIn || before.timeOut !== after.timeOut || before.date !== after.date || before.landowner !== after.landowner)) {
+            audits.push(auditEntry(session, 'UPDATE_ATTENDANCE', id, JSON.stringify(before), JSON.stringify(after), rec.adjustmentReason));
+          }
+        }
+      } else {
+        obj._row = nextRow++;
+        newRows.push(obj);
+        byId[id] = obj;
+        if (isLeave) audits.push(auditEntry(session, 'RECORD_LEAVE', id, '', (obj['Leave Type'] || 'Leave') + ' - ' + obj['Employee Name'] + ' - ' + obj['Attendance Date'], obj['Leave Remarks'] || ''));
+        else if (rec.adjustmentReason) audits.push(auditEntry(session, 'MANUAL_ATTENDANCE', id, '', JSON.stringify({ date: obj['Attendance Date'], timeIn: obj['Time IN'], timeOut: obj['Time OUT'] }), rec.adjustmentReason));
+      }
+      syncedIds.push(id);
+    } catch (err) {
+      rejected.push({ id: id, reason: err.message });
+    }
+  });
+
+  if (newRows.length) writeRows(sheet, newRows[0]._row, H, newRows);
+  logAudits(audits);
+
+  var serverValues = {};
+  syncedIds.forEach(function (id) {
+    var o = byId[id];
+    serverValues[id] = {
+      hoursWorked: o['Hours Worked'], overtimeHours: o['Overtime Hours'],
+      distanceInMeters: o['Distance IN Meters'], distanceOutMeters: o['Distance OUT Meters'],
+      geofenceIn: o['Geofence IN'], geofenceOut: o['Geofence OUT'],
+      photoIn: o['Photo IN'] || '', photoOut: o['Photo OUT'] || '', clockFlag: o['Clock Flag'] || ''
+    };
+  });
+
+  return respondJSON({ success: true, syncedIds: syncedIds, rejected: rejected, serverValues: serverValues, count: syncedIds.length });
+}
+
+/* ==========================================================================
+   PHOTOS (Google Drive)
+   ========================================================================== */
+
+function getPhotoFolder(dateStr) {
+  var props = PropertiesService.getScriptProperties();
+  var rootId = props.getProperty('PHOTO_ROOT_ID');
+  var root = null;
+  if (rootId) { try { root = DriveApp.getFolderById(rootId); } catch (e) { root = null; } }
+  if (!root) {
+    var it = DriveApp.getFoldersByName(PHOTO_ROOT_FOLDER);
+    root = it.hasNext() ? it.next() : DriveApp.createFolder(PHOTO_ROOT_FOLDER);
+    props.setProperty('PHOTO_ROOT_ID', root.getId());
   }
+  var month = String(dateStr || '').substring(0, 7) || 'undated';
+  var sub = root.getFoldersByName(month);
+  return sub.hasNext() ? sub.next() : root.createFolder(month);
+}
 
-  var rowValues = [
-    empId,
-    emp.employeeName,
-    emp.position || '',
-    emp.department || '',
-    emp.supervisorId || '',
-    emp.supervisorName || '',
-    emp.landownerId || '',
-    emp.landownerName || '',
-    emp.locationId || '',
-    emp.workLocation || '',
-    emp.employmentStatus || 'Active',
-    emp.dateEnrolled || new Date().toISOString().split('T')[0]
-  ];
+function handleUploadPhotos(session, payload) {
+  var photos = payload.photos || [];
+  if (photos.length > MAX_PHOTOS_PER_REQUEST) return fail('Too many photos in one request.', 'VALIDATION');
 
-  if (isEdit && foundRow !== -1) {
-    var prev = JSON.stringify(data[foundRow - 1]);
-    sheet.getRange(foundRow, 1, 1, rowValues.length).setValues([rowValues]);
-    logAudit(userId, userRole, 'UPDATE_EMPLOYEE', empId, prev, JSON.stringify(emp), 'Employee updated/reassigned');
+  var H = HEADERS.ATTENDANCE;
+  var sheet = getSheet(SHEET_NAMES.ATTENDANCE);
+  var rows = readRowsByHeader(SHEET_NAMES.ATTENDANCE, H);
+  var byId = {};
+  rows.forEach(function (r) { byId[String(r['Attendance Record ID'])] = r; });
+
+  var uploaded = [], rejected = [];
+
+  photos.forEach(function (p) {
+    try {
+      var kind = p.kind === 'OUT' ? 'OUT' : 'IN';
+      var col = kind === 'OUT' ? 'Photo OUT' : 'Photo IN';
+      var row = byId[String(p.recordId)];
+      if (!row) throw new Error('RECORD_NOT_SYNCED');
+      if (session.role !== 'Admin' && String(row['Supervisor ID']) !== session.supervisorId) throw new Error('Not your record.');
+
+      var fileName = row['Attendance Date'] + '_' + row['Employee ID'] + '_' + kind + '_' + p.recordId + '.jpg';
+      var folder = getPhotoFolder(row['Attendance Date']);
+
+      // Idempotent: if this photo was already uploaded, reuse it
+      var file = null;
+      var existing = folder.getFilesByName(fileName);
+      if (existing.hasNext()) file = existing.next();
+
+      if (!file) {
+        var m = String(p.dataUrl || '').match(/^data:image\/(jpeg|jpg|png|webp);base64,(.+)$/);
+        if (!m) throw new Error('Photo data is not a valid image.');
+        var bytes = Utilities.base64Decode(m[2]);
+        if (bytes.length > MAX_PHOTO_BYTES) throw new Error('Photo is too large.');
+        var blob = Utilities.newBlob(bytes, 'image/jpeg', fileName);
+        file = folder.createFile(blob);
+        file.setDescription('CocoTrack ' + kind + ' | ' + row['Employee Name'] + ' | ' + row['Attendance Date'] +
+          ' | taken ' + (p.takenAt || '') + ' | by ' + session.username);
+      }
+
+      var url = file.getUrl();
+      if (row[col] !== url) {
+        var colIdx = headerIndex(H)[col] + 1;
+        sheet.getRange(row._row, colIdx).setNumberFormat('@').setValue(url);
+        row[col] = url;
+      }
+      uploaded.push({ photoId: p.photoId, recordId: p.recordId, kind: kind, url: url, fileId: file.getId() });
+    } catch (err) {
+      rejected.push({ photoId: p.photoId, recordId: p.recordId, reason: err.message });
+    }
+  });
+
+  return respondJSON({ success: true, uploaded: uploaded, rejected: rejected });
+}
+
+/** Returns a photo as a data URL so the app can show it without sharing the Drive file. */
+function handleGetPhoto(session, payload) {
+  var rows = readRowsByHeader(SHEET_NAMES.ATTENDANCE, HEADERS.ATTENDANCE);
+  var row = null;
+  for (var i = 0; i < rows.length; i++) if (String(rows[i]['Attendance Record ID']) === String(payload.recordId)) { row = rows[i]; break; }
+  if (!row) return fail('Record not found.', 'VALIDATION');
+  if (session.role !== 'Admin' && String(row['Supervisor ID']) !== session.supervisorId) return fail('Not your record.', 'FORBIDDEN');
+  var url = String(row[payload.kind === 'OUT' ? 'Photo OUT' : 'Photo IN'] || '');
+  var m = url.match(/[-\w]{25,}/);
+  if (!m) return fail('No photo saved for this record.', 'VALIDATION');
+  var blob = DriveApp.getFileById(m[0]).getBlob();
+  return respondJSON({ success: true, dataUrl: 'data:' + blob.getContentType() + ';base64,' + Utilities.base64Encode(blob.getBytes()), url: url });
+}
+
+/* ==========================================================================
+   MASTER DATA (ADMIN)
+   ========================================================================== */
+
+function findRowIndex(sheetName, headers, keyHeader, keyValue) {
+  var rows = readRowsByHeader(sheetName, headers);
+  var v = String(keyValue).trim().toLowerCase();
+  for (var i = 0; i < rows.length; i++) {
+    if (String(rows[i][keyHeader]).trim().toLowerCase() === v) return rows[i];
+  }
+  return null;
+}
+
+function upsert(sheetName, headers, keyHeader, obj) {
+  var sheet = getSheet(sheetName);
+  var prev = findRowIndex(sheetName, headers, keyHeader, obj[keyHeader]);
+  if (prev) {
+    writeRow(sheet, prev._row, headers, obj);
   } else {
-    sheet.appendRow(rowValues);
-    // Explicitly set text format to preserve leading zeros
-    sheet.getRange(sheet.getLastRow(), 1).setNumberFormat('@');
-    logAudit(userId, userRole, 'ENROLL_EMPLOYEE', empId, '', JSON.stringify(emp), 'New employee enrollment');
+    writeRow(sheet, Math.max(sheet.getLastRow(), 1) + 1, headers, obj);
   }
+  return prev;
+}
 
+function handleSaveEmployee(session, payload) {
+  var emp = payload.employee || {};
+  var empId = String(emp.employeeId || '').trim();
+  if (!empId || !String(emp.employeeName || '').trim()) return fail('Employee ID and Full Name are mandatory.', 'VALIDATION');
+  var isEdit = payload.isEdit === true;
+  var H = HEADERS.EMPLOYEES;
+  var prev = findRowIndex(SHEET_NAMES.EMPLOYEES, H, 'Employee ID', empId);
+  if (!isEdit && prev) return fail('Employee ID "' + empId + '" already exists. Duplicate IDs are not allowed.', 'DUPLICATE');
+  if (isEdit && !prev) return fail('Employee ID "' + empId + '" was not found on the server.', 'VALIDATION');
+
+  emp.employeeId = empId;
+  emp.employmentStatus = emp.employmentStatus || 'Active';
+  emp.dateEnrolled = emp.dateEnrolled || Utilities.formatDate(new Date(), SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone(), 'yyyy-MM-dd');
+  upsert(SHEET_NAMES.EMPLOYEES, H, 'Employee ID', fromApp(emp, H));
+  logAudits([auditEntry(session, prev ? 'UPDATE_EMPLOYEE' : 'ENROLL_EMPLOYEE', empId,
+    prev ? JSON.stringify(toApp(prev, H)) : '', JSON.stringify(emp), prev ? 'Employee updated/reassigned' : 'New employee enrollment')]);
   return respondJSON({ success: true, employee: emp });
 }
 
-/**
- * Save Supervisor
- */
-function handleSaveSupervisor(payload) {
-  var sup = payload.supervisor;
-  var userId = payload.userId || 'ADMIN';
-  var userRole = payload.userRole || 'Admin';
+function handleSaveSupervisor(session, payload) {
+  var sup = payload.supervisor || {};
+  var supId = String(sup.supervisorId || '').trim();
+  var username = String(sup.username || '').trim();
+  if (!supId || !String(sup.supervisorName || '').trim() || !username) return fail('Supervisor ID, Name, and Username are required.', 'VALIDATION');
 
-  if (!sup || !sup.supervisorId || !sup.supervisorName || !sup.username) {
-    return respondJSON({ success: false, error: 'Supervisor ID, Name, and Username are required.' });
-  }
+  var prevSup = findRowIndex(SHEET_NAMES.SUPERVISORS, HEADERS.SUPERVISORS, 'Supervisor ID', supId);
+  var users = readRowsByHeader(SHEET_NAMES.USERS, HEADERS.USERS);
+  var ownUser = null, clash = null;
+  users.forEach(function (u) {
+    if (String(u['Linked Supervisor ID']) === supId && u['Role'] === 'Supervisor') ownUser = u;
+  });
+  users.forEach(function (u) {
+    if (String(u['Username']).toLowerCase() === username.toLowerCase() && u !== ownUser) clash = u;
+  });
+  if (clash) return fail('Username "' + username + '" is already used by another account.', 'DUPLICATE');
+  if (!ownUser && !/^[a-f0-9]{64}$/.test(String(sup.passwordHash || ''))) return fail('A password is required for a new supervisor.', 'VALIDATION');
 
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var sheet = ss.getSheetByName(SHEET_NAMES.SUPERVISORS);
-  var data = sheet.getDataRange().getValues();
+  upsert(SHEET_NAMES.SUPERVISORS, HEADERS.SUPERVISORS, 'Supervisor ID', {
+    'Supervisor ID': supId, 'Supervisor Name': sup.supervisorName, 'Username': username,
+    'Password Hash': '', 'Account Status': sup.accountStatus || 'Active'
+  });
 
-  var foundRow = -1;
-  for (var i = 1; i < data.length; i++) {
-    if (data[i][0].toString() === sup.supervisorId.toString()) {
-      foundRow = i + 1;
-      break;
-    }
-  }
+  var userObj = ownUser || { 'User ID': 'USR-' + supId, 'Last Login': '' };
+  userObj['Username'] = username;
+  userObj['Role'] = 'Supervisor';
+  userObj['Linked Supervisor ID'] = supId;
+  userObj['Account Status'] = sup.accountStatus || 'Active';
+  if (sup.passwordHash) setPassword(userObj, sup.passwordHash, true);
+  var userSheet = getSheet(SHEET_NAMES.USERS);
+  writeRow(userSheet, ownUser ? ownUser._row : Math.max(userSheet.getLastRow(), 1) + 1, HEADERS.USERS, userObj);
 
-  var rowValues = [
-    sup.supervisorId,
-    sup.supervisorName,
-    sup.username,
-    sup.passwordHash || '',
-    sup.accountStatus || 'Active'
-  ];
-
-  if (foundRow !== -1) {
-    sheet.getRange(foundRow, 1, 1, rowValues.length).setValues([rowValues]);
-    logAudit(userId, userRole, 'UPDATE_SUPERVISOR', sup.supervisorId, '', JSON.stringify(sup), 'Supervisor updated');
-  } else {
-    sheet.appendRow(rowValues);
-    logAudit(userId, userRole, 'ENROLL_SUPERVISOR', sup.supervisorId, '', JSON.stringify(sup), 'New supervisor enrolled');
-  }
-
-  // Also sync account to Users sheet
-  syncSupervisorUserAccount(sup);
-
+  logAudits([auditEntry(session, prevSup ? 'UPDATE_SUPERVISOR' : 'ENROLL_SUPERVISOR', supId, '',
+    JSON.stringify({ name: sup.supervisorName, username: username, status: sup.accountStatus }), prevSup ? 'Supervisor updated' : 'New supervisor enrolled')]);
+  delete sup.passwordHash;
   return respondJSON({ success: true, supervisor: sup });
 }
 
-/**
- * Sync Supervisor to Users sheet
- */
-function syncSupervisorUserAccount(sup) {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var userSheet = ss.getSheetByName(SHEET_NAMES.USERS);
-  var data = userSheet.getDataRange().getValues();
-
-  var foundRow = -1;
-  for (var i = 1; i < data.length; i++) {
-    if (data[i][4].toString() === sup.supervisorId.toString() ||
-        data[i][1].toString().toLowerCase() === sup.username.toLowerCase()) {
-      foundRow = i + 1;
-      break;
-    }
-  }
-
-  var userRowValues = [
-    'USR-' + sup.supervisorId,
-    sup.username,
-    sup.passwordHash || '',
-    'Supervisor',
-    sup.supervisorId,
-    sup.accountStatus || 'Active',
-    new Date().toISOString()
-  ];
-
-  if (foundRow !== -1) {
-    // Preserve existing password if new one not supplied
-    if (!sup.passwordHash) {
-      userRowValues[2] = data[foundRow - 1][2];
-    }
-    userSheet.getRange(foundRow, 1, 1, userRowValues.length).setValues([userRowValues]);
-  } else {
-    userSheet.appendRow(userRowValues);
-  }
-}
-
-/**
- * Save Landowner
- */
-function handleSaveLandowner(payload) {
-  var lnd = payload.landowner;
-  var userId = payload.userId || 'ADMIN';
-  var userRole = payload.userRole || 'Admin';
-
-  if (!lnd || !lnd.landownerId || !lnd.landownerName) {
-    return respondJSON({ success: false, error: 'Landowner ID and Name are required.' });
-  }
-
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var sheet = ss.getSheetByName(SHEET_NAMES.LANDOWNERS);
-  var data = sheet.getDataRange().getValues();
-
-  var foundRow = -1;
-  for (var i = 1; i < data.length; i++) {
-    if (data[i][0].toString() === lnd.landownerId.toString()) {
-      foundRow = i + 1;
-      break;
-    }
-  }
-
-  var rowValues = [
-    lnd.landownerId,
-    lnd.landownerName,
-    lnd.locationId || '',
-    lnd.workLocation || '',
-    lnd.supervisorId || '',
-    lnd.status || 'Active'
-  ];
-
-  if (foundRow !== -1) {
-    sheet.getRange(foundRow, 1, 1, rowValues.length).setValues([rowValues]);
-    logAudit(userId, userRole, 'UPDATE_LANDOWNER', lnd.landownerId, '', JSON.stringify(lnd), 'Landowner updated');
-  } else {
-    sheet.appendRow(rowValues);
-    logAudit(userId, userRole, 'ENROLL_LANDOWNER', lnd.landownerId, '', JSON.stringify(lnd), 'New landowner enrolled');
-  }
-
+function handleSaveLandowner(session, payload) {
+  var lnd = payload.landowner || {};
+  if (!lnd.landownerId || !lnd.landownerName) return fail('Landowner ID and Name are required.', 'VALIDATION');
+  var H = HEADERS.LANDOWNERS;
+  var prev = upsert(SHEET_NAMES.LANDOWNERS, H, 'Landowner ID', fromApp(lnd, H));
+  logAudits([auditEntry(session, prev ? 'UPDATE_LANDOWNER' : 'ENROLL_LANDOWNER', lnd.landownerId,
+    prev ? JSON.stringify(toApp(prev, H)) : '', JSON.stringify(lnd), prev ? 'Landowner updated' : 'New landowner enrolled')]);
   return respondJSON({ success: true, landowner: lnd });
 }
 
-/**
- * Save Location
- */
-function handleSaveLocation(payload) {
-  var loc = payload.location;
-  var userId = payload.userId || 'ADMIN';
-  var userRole = payload.userRole || 'Admin';
+function handleSaveLocation(session, payload) {
+  var loc = payload.location || {};
+  if (!loc.locationId || !loc.workLocationName) return fail('Location ID and Name are required.', 'VALIDATION');
+  var lat = loc.latitude === '' || loc.latitude === undefined ? '' : Number(loc.latitude);
+  var lng = loc.longitude === '' || loc.longitude === undefined ? '' : Number(loc.longitude);
+  if ((lat === '') !== (lng === '')) return fail('Enter both latitude and longitude, or leave both empty.', 'VALIDATION');
+  if (lat !== '' && (isNaN(lat) || lat < -90 || lat > 90 || isNaN(lng) || lng < -180 || lng > 180)) return fail('Latitude/Longitude are out of range.', 'VALIDATION');
+  loc.latitude = lat; loc.longitude = lng;
+  loc.radiusMeters = loc.radiusMeters === '' || loc.radiusMeters === undefined ? '' : Number(loc.radiusMeters);
 
-  if (!loc || !loc.locationId || !loc.workLocationName) {
-    return respondJSON({ success: false, error: 'Location ID and Name are required.' });
-  }
-
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var sheet = ss.getSheetByName(SHEET_NAMES.LOCATIONS);
-  var data = sheet.getDataRange().getValues();
-
-  var foundRow = -1;
-  for (var i = 1; i < data.length; i++) {
-    if (data[i][0].toString() === loc.locationId.toString()) {
-      foundRow = i + 1;
-      break;
-    }
-  }
-
-  var rowValues = [
-    loc.locationId,
-    loc.workLocationName,
-    loc.description || '',
-    loc.landownerId || '',
-    loc.landownerName || '',
-    loc.supervisorId || '',
-    loc.status || 'Active'
-  ];
-
-  if (foundRow !== -1) {
-    sheet.getRange(foundRow, 1, 1, rowValues.length).setValues([rowValues]);
-    logAudit(userId, userRole, 'UPDATE_LOCATION', loc.locationId, '', JSON.stringify(loc), 'Work location updated');
-  } else {
-    sheet.appendRow(rowValues);
-    logAudit(userId, userRole, 'ENROLL_LOCATION', loc.locationId, '', JSON.stringify(loc), 'New work location enrolled');
-  }
-
+  var H = HEADERS.LOCATIONS;
+  var prev = upsert(SHEET_NAMES.LOCATIONS, H, 'Location ID', fromApp(loc, H));
+  logAudits([auditEntry(session, prev ? 'UPDATE_LOCATION' : 'ENROLL_LOCATION', loc.locationId,
+    prev ? JSON.stringify(toApp(prev, H)) : '', JSON.stringify(loc), prev ? 'Work location updated' : 'New work location enrolled')]);
   return respondJSON({ success: true, location: loc });
 }
 
-/**
- * Save User / Reset Password
- */
-function handleSaveUser(payload) {
-  var user = payload.user;
-  var userId = payload.userId || 'ADMIN';
-  var userRole = payload.userRole || 'Admin';
+function handleSaveUser(session, payload) {
+  var user = payload.user || {};
+  var username = String(user.username || '').trim();
+  if (!username) return fail('Username is required.', 'VALIDATION');
+  var role = user.role === 'Admin' ? 'Admin' : 'Supervisor';
 
-  if (!user || !user.username) {
-    return respondJSON({ success: false, error: 'Username is required.' });
+  var existing = findUserBy('Username', username);
+  if (existing && user.userId && String(existing['User ID']) !== String(user.userId)) return fail('Username already taken.', 'DUPLICATE');
+  if (!existing && !/^[a-f0-9]{64}$/.test(String(user.newPasswordHash || ''))) return fail('A password is required for a new account.', 'VALIDATION');
+  if (existing && String(existing['User ID']) === session.userId && user.accountStatus && user.accountStatus !== 'Active') {
+    return fail('You cannot deactivate your own account.', 'VALIDATION');
   }
 
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var sheet = ss.getSheetByName(SHEET_NAMES.USERS);
-  var data = sheet.getDataRange().getValues();
+  var row = existing || { 'User ID': user.userId || ('USR-' + Date.now()), 'Last Login': '' };
+  row['Username'] = username;
+  row['Role'] = role;
+  row['Linked Supervisor ID'] = role === 'Supervisor' ? String(user.linkedSupervisorId || row['Linked Supervisor ID'] || '') : '';
+  row['Account Status'] = user.accountStatus || row['Account Status'] || 'Active';
+  if (user.newPasswordHash) setPassword(row, user.newPasswordHash, true);
 
-  var foundRow = -1;
-  for (var i = 1; i < data.length; i++) {
-    if (data[i][1].toString().toLowerCase() === user.username.toLowerCase()) {
-      foundRow = i + 1;
-      break;
-    }
-  }
-
-  var rowValues = [
-    user.userId || ('USR-' + Date.now()),
-    user.username,
-    user.passwordHash || '',
-    user.role || 'Supervisor',
-    user.linkedSupervisorId || '',
-    user.accountStatus || 'Active',
-    new Date().toISOString()
-  ];
-
-  if (foundRow !== -1) {
-    if (!user.passwordHash) {
-      rowValues[2] = data[foundRow - 1][2]; // Keep existing hash
-    }
-    sheet.getRange(foundRow, 1, 1, rowValues.length).setValues([rowValues]);
-    logAudit(userId, userRole, 'UPDATE_USER', user.username, '', '', 'User account updated');
-  } else {
-    sheet.appendRow(rowValues);
-    logAudit(userId, userRole, 'CREATE_USER', user.username, '', '', 'New user created');
-  }
-
-  return respondJSON({ success: true, user: user });
+  var sheet = getSheet(SHEET_NAMES.USERS);
+  writeRow(sheet, existing ? existing._row : Math.max(sheet.getLastRow(), 1) + 1, HEADERS.USERS, row);
+  logAudits([auditEntry(session, existing ? (user.newPasswordHash ? 'RESET_PASSWORD' : 'UPDATE_USER') : 'CREATE_USER', username, '',
+    JSON.stringify({ role: role, status: row['Account Status'] }), existing ? 'User account updated' : 'New user created')]);
+  return respondJSON({ success: true, user: toApp(row, HEADERS.USERS, { 'Password Hash': true, 'Salt': true }) });
 }
 
-/**
- * Soft Delete Attendance (Never permanently erased; preserves audit history)
- */
-function handleSoftDeleteAttendance(payload) {
-  var recordId = payload.recordId;
-  var userId = payload.userId || 'ADMIN';
-  var userRole = payload.userRole || 'Admin';
-  var reason = payload.reason || 'Soft deleted by user';
-
-  if (!recordId) {
-    return respondJSON({ success: false, error: 'Record ID required.' });
-  }
-
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var sheet = ss.getSheetByName(SHEET_NAMES.ATTENDANCE);
-  var data = sheet.getDataRange().getValues();
-
-  var foundRow = -1;
-  for (var i = 1; i < data.length; i++) {
-    if (data[i][0].toString() === recordId.toString()) {
-      foundRow = i + 1;
-      break;
-    }
-  }
-
-  if (foundRow === -1) {
-    return respondJSON({ success: false, error: 'Attendance record not found.' });
-  }
-
-  // Update Record Status (Column 22 = V) to 'DELETED'
-  sheet.getRange(foundRow, 22).setValue('DELETED');
-
-  logAudit(userId, userRole, 'SOFT_DELETE_ATTENDANCE', recordId, 'ACTIVE', 'DELETED', reason);
-
-  return respondJSON({ success: true, recordId: recordId, message: 'Record soft-deleted successfully.' });
+function handleSoftDeleteAttendance(session, payload) {
+  var recordId = String(payload.recordId || '');
+  if (!recordId) return fail('Record ID required.', 'VALIDATION');
+  var row = findRowIndex(SHEET_NAMES.ATTENDANCE, HEADERS.ATTENDANCE, 'Attendance Record ID', recordId);
+  if (!row) return fail('Attendance record not found.', 'VALIDATION');
+  if (session.role !== 'Admin' && String(row['Supervisor ID']) !== session.supervisorId) return fail('Not your record.', 'FORBIDDEN');
+  var col = headerIndex(HEADERS.ATTENDANCE)['Record Status'] + 1;
+  getSheet(SHEET_NAMES.ATTENDANCE).getRange(row._row, col).setValue('DELETED');
+  logAudits([auditEntry(session, 'SOFT_DELETE_ATTENDANCE', recordId, 'ACTIVE', 'DELETED', payload.reason || 'Soft deleted by user')]);
+  return respondJSON({ success: true, recordId: recordId });
 }
 
-/**
- * Audit Logging Helper
- */
-function logAudit(userId, userRole, action, recordId, prevVal, newVal, reason) {
+/* ==========================================================================
+   PROFILE PHOTOS (user avatars & employee registration photos)
+   Stored as small JPEG data URLs in the "Profile Photos" sheet so phones can cache them offline.
+   ========================================================================== */
+
+function canTouchPhoto(session, type, ownerId) {
+  if (session.role === 'Admin') return true;
+  if (type === 'USER') return String(ownerId) === session.userId;
+  if (type === 'EMPLOYEE') {
+    var emp = findRowIndex(SHEET_NAMES.EMPLOYEES, HEADERS.EMPLOYEES, 'Employee ID', ownerId);
+    return !!emp && String(emp['Supervisor ID']) === session.supervisorId;
+  }
+  return false;
+}
+
+function handleSaveProfilePhoto(session, payload) {
+  var type = payload.type === 'EMPLOYEE' ? 'EMPLOYEE' : (payload.type === 'USER' ? 'USER' : '');
+  var ownerId = String(payload.ownerId || '').trim();
+  var image = String(payload.image || '');
+  if (!type || !ownerId) return fail('Photo type and owner are required.', 'VALIDATION');
+  if (image && (!/^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+\/=]+$/.test(image) || image.length > MAX_PROFILE_IMAGE_CHARS)) {
+    return fail('Photo is not a valid small image.', 'VALIDATION');
+  }
+  if (type === 'USER' && !findUserBy('User ID', ownerId)) return fail('User not found.', 'VALIDATION');
+  if (type === 'EMPLOYEE' && !findRowIndex(SHEET_NAMES.EMPLOYEES, HEADERS.EMPLOYEES, 'Employee ID', ownerId)) return fail('Employee not found.', 'VALIDATION');
+  if (!canTouchPhoto(session, type, ownerId)) return fail('You cannot change this photo.', 'FORBIDDEN');
+
+  var key = type + ':' + ownerId;
+  var nowIso = new Date().toISOString();
+  upsert(SHEET_NAMES.PROFILE_PHOTOS, HEADERS.PROFILE_PHOTOS, 'Photo Key', {
+    'Photo Key': key, 'Type': type, 'Owner ID': ownerId, 'Image': image, 'Updated At': nowIso, 'Updated By': session.username
+  });
+  logAudits([auditEntry(session, image ? 'SET_PROFILE_PHOTO' : 'REMOVE_PROFILE_PHOTO', key, '', '', type === 'USER' ? 'User avatar' : 'Employee photo')]);
+  return respondJSON({ success: true, key: key, updatedAt: nowIso });
+}
+
+/** Returns photos changed after `since` (ISO). Supervisors get their own avatar + their employees. */
+function handleGetProfilePhotos(session, payload) {
+  var since = String(payload.since || '');
+  var readStartedAt = new Date().toISOString(); // next "since": anything saved after this moment is sent next time
+  var rows = readRowsByHeader(SHEET_NAMES.PROFILE_PHOTOS, HEADERS.PROFILE_PHOTOS);
+  var allowedEmp = null;
+  if (session.role !== 'Admin') {
+    allowedEmp = {};
+    readRowsByHeader(SHEET_NAMES.EMPLOYEES, HEADERS.EMPLOYEES).forEach(function (e) {
+      if (String(e['Supervisor ID']) === session.supervisorId) allowedEmp[String(e['Employee ID'])] = true;
+    });
+  }
+  var photos = rows.filter(function (r) {
+    if (since && String(r['Updated At']) < since) return false; // same-millisecond changes are re-sent (harmless)
+    if (!allowedEmp) return true;
+    if (r['Type'] === 'USER') return String(r['Owner ID']) === session.userId;
+    return !!allowedEmp[String(r['Owner ID'])];
+  }).map(function (r) {
+    return { key: r['Photo Key'], type: r['Type'], ownerId: String(r['Owner ID']), image: r['Image'] || '', updatedAt: r['Updated At'] };
+  });
+  return respondJSON({ success: true, photos: photos, serverTime: readStartedAt });
+}
+
+/* ==========================================================================
+   AUDIT LOGS
+   ========================================================================== */
+
+function auditEntry(session, action, recordId, prevVal, newVal, reason) {
+  return {
+    'Log ID': 'LOG-' + Date.now() + '-' + Math.floor(Math.random() * 100000),
+    'User ID': session ? session.userId : 'SYSTEM',
+    'User Role': session ? session.role : 'SYSTEM',
+    'Action': action,
+    'Record ID': recordId || '',
+    'Previous Value': String(prevVal || '').substring(0, 45000),
+    'New Value': String(newVal || '').substring(0, 45000),
+    'Reason': reason || '',
+    'Date and Time': new Date().toISOString()
+  };
+}
+
+function logAudits(entries) {
+  if (!entries || !entries.length) return;
   try {
-    var ss = SpreadsheetApp.getActiveSpreadsheet();
-    var sheet = ss.getSheetByName(SHEET_NAMES.AUDIT_LOGS);
-    if (!sheet) return;
-
-    var logId = 'LOG-' + Date.now() + '-' + Math.floor(Math.random() * 1000);
-    sheet.appendRow([
-      logId,
-      userId,
-      userRole,
-      action,
-      recordId,
-      prevVal || '',
-      newVal || '',
-      reason || '',
-      new Date().toISOString()
-    ]);
+    var sheet = getSheet(SHEET_NAMES.AUDIT_LOGS);
+    writeRows(sheet, Math.max(sheet.getLastRow(), 1) + 1, HEADERS.AUDIT_LOGS, entries);
   } catch (e) {
     console.error('Audit Log failed:', e);
   }
 }
 
-/**
- * Get Audit Logs
- */
-function handleGetAuditLogs() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var sheet = ss.getSheetByName(SHEET_NAMES.AUDIT_LOGS);
-  if (!sheet || sheet.getLastRow() <= 1) {
-    return respondJSON({ success: true, logs: [] });
-  }
-
-  var data = sheet.getDataRange().getValues();
-  var headers = data[0];
-  var logs = [];
-
-  for (var r = 1; r < data.length; r++) {
-    var row = data[r];
-    logs.push({
-      logId: row[0],
-      userId: row[1],
-      userRole: row[2],
-      action: row[3],
-      recordId: row[4],
-      previousValue: row[5],
-      newValue: row[6],
-      reason: row[7],
-      dateTime: row[8]
-    });
-  }
-
-  // Sort newest first
-  logs.reverse();
-
+function handleGetAuditLogs(session, payload) {
+  var sheet = getSheet(SHEET_NAMES.AUDIT_LOGS);
+  var last = sheet.getLastRow();
+  if (last <= 1) return respondJSON({ success: true, logs: [] });
+  var limit = Math.min(Number(payload.limit) || 500, 2000);
+  var start = Math.max(2, last - limit + 1);
+  var data = sheet.getRange(start, 1, last - start + 1, HEADERS.AUDIT_LOGS.length).getValues();
+  var logs = data.map(function (row) {
+    return {
+      logId: row[0], userId: row[1], userRole: row[2], action: row[3], recordId: row[4],
+      previousValue: row[5], newValue: row[6], reason: row[7],
+      dateTime: row[8] instanceof Date ? row[8].toISOString() : row[8]
+    };
+  }).reverse();
   return respondJSON({ success: true, logs: logs });
-}
-
-/**
- * Utility: String to camelCase
- */
-function toCamelCase(str) {
-  return str.toLowerCase().replace(/[^a-zA-Z0-9]+(.)/g, function(match, chr) {
-    return chr.toUpperCase();
-  });
 }
