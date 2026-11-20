@@ -1,211 +1,139 @@
-# Employee Attendance Monitoring System
-### Mobile-First, Offline-Ready PWA with Google Sheets Database & Google Apps Script API
-
-A complete, responsive, mobile-friendly **Employee Attendance Monitoring System** built with HTML5, CSS3, JavaScript, and Google Apps Script, with Google Sheets serving as the central cloud database.
+# CocoTrack Attendance & Field Monitoring — v3
+### Offline-ready PWA · Google Sheets database · Google Apps Script API · Watermarked photo proof
 
 ---
 
-## 🌟 Key Features
+## What's new in v3
 
-1. **Role-Based Access Control**:
-   - **Admin**: Full organization control, employee enrollment, supervisor assignments, landowner & location management, global attendance monitoring, user management, and audit logs.
-   - **Supervisor**: Restricted access. Supervisors can **only view and manage employees assigned to them**, their designated landowners, and work locations.
-   - **Employee**: Field personnel monitored by the system.
-
-2. **Admin Dashboard (summary only)**:
-   - Admins do not record attendance. The dashboard shows a summary for any date: Total, Present, On Leave, Absent, Pending Upload.
-   - Pie (donut) chart of Present / On Leave / Absent, a per-supervisor table (Team, Present, Leave, Absent, Rate), a 7-day trend, and an "Absent - Needs Follow-up" list grouped by supervisor.
-   - Filters by Supervisor and Work Location, previous/next day, **Export CSV** day report.
-   - *Absent* is calculated automatically: an active employee with no Time IN and no leave for that date.
-
-3. **Landowners follow the Work Location**:
-   - Admin registers a Landowner under a Work Location (Landowners page). The supervisor is taken automatically from that location (Work Locations page).
-   - A supervisor only sees landowners registered under the location(s) assigned to him/her. Example: Farm 4 Block 1 is assigned to Francis, so Francis only sees the landowners of Farm 4 Block 1.
-   - This applies to the Area Checking popup, the Adjust form, the History filter and the data downloaded to the phone (`Code.gs`). Supervisors cannot type a custom landowner, and the login screen no longer lists landowners.
-   - If a location has no supervisor, or a landowner has no location, nobody sees that landowner until the admin fixes it.
-
-4. **On Leave** (Supervisor):
-   - On **Record Attendance**, tap **Mark On Leave** on an employee: choose Leave Type (Sick, Vacation, Emergency, Personal, Other), From date, optional To date (one record is created per day, up to 31 days) and remarks.
-   - An employee on leave cannot Time IN that day until the leave is cancelled (**Cancel Leave** keeps an audit trail).
-   - Leave syncs offline/online like any other record and appears in History (filter by type), the dashboards and CSV exports.
-
-5. **100% Offline Capability**:
-   - Built with **IndexedDB** for storing thousands of offline attendance records safely on the device.
-   - **Service Worker (`sw.js`)** pre-caches application assets for instant offline load.
-   - **Offline Authentication**: Supervisors and Admins who have logged in once can log in offline using cryptographically hashed credentials (SHA-256 via Web Crypto API).
-   - Generates a local unique **Attendance Record ID** for every punch.
-
-6. **Smart Synchronization & Duplicate Prevention**:
-   - **Automatic Sync**: Detects internet restoration (`online` event & Service Worker message) and syncs pending records automatically.
-   - **Manual Sync**: Sync All Pending, Retry Failed, or Sync Selected records.
-   - **Idempotent Upsert**: Backend validates `Attendance Record ID` before inserting. If a record already exists, it updates the record (e.g. adding Time OUT or manual adjustment) instead of creating duplicate rows.
-   - **History Retention**: Local records are **never deleted** after synchronization; their status simply changes to `SYNCED`.
-
-7. **Accurate Attendance Recording (Time IN & Time OUT)**:
-   - High-accuracy GPS coordinate capture (Latitude, Longitude, Accuracy in meters) via `navigator.geolocation`.
-   - **Separation of Locations**: Assigned Work Location and Actual GPS Location are tracked separately to verify field presence.
-   - Device timestamping and supervisor signature.
-   - **Manual Adjustments with Audit Trail**: Editable date and time with mandatory reason, recording both original and adjusted timestamps.
-
-8. **Data Protection & Soft Deletion**:
-   - Records are never permanently deleted by accident. Authorized deletions mark `recordStatus = 'DELETED'` and log the action, timestamp, and user reason into the **Audit Logs**.
-   - One-click **Export to CSV / Excel** with UTF-8 BOM encoding.
+| Area | Change |
+|---|---|
+| **Photo proof** | Time IN and Time OUT open a live camera. The photo is stamped with **TIME IN/OUT, time (with seconds), date, employee + ID, landowner, work location, GPS ± accuracy, geofence result, supervisor, record ID** and the CocoTrack emblem. Photos are saved to Google Drive (`CocoTrack Photos/yyyy-MM`) and linked in the Attendance sheet. |
+| **Security** | Every request needs a **session token** from login. Role and supervisor are read from the Users sheet, never trusted from the phone. Passwords are **salted + stretched** on the server. Deactivating a user ends their sessions immediately. |
+| **Login fix** | A server "no" (wrong password, deactivated) no longer falls back to the offline login. Offline login only works when the server can't be reached, and only within *N* days of the last online login. |
+| **Default admin** | `admin / admin123` must be changed at first login. Reset passwords are temporary and must be changed too. |
+| **Geofence** | Each work location can have latitude, longitude and radius ("Use my current GPS" button). Out-of-area punches are **warned + flagged** or **blocked** (admin setting). The server re-checks the distance. |
+| **Fresh GPS** | GPS is read at the moment of each punch (no more stale positions). |
+| **Phone clock check** | Records are flagged when the phone clock differs from the server clock, or jumps backwards. |
+| **Hours & overtime** | Calculated on the phone and on the server (break deduction and regular hours are configurable). |
+| **Cut-off summary** | On the **Admin dashboard** (all manpower, with per-supervisor subtotals) and the **Supervisor dashboard** (only their assigned manpower), plus its own page. Pick any **From → To** dates or a quick cut-off (1–15 / 16–end, previous cut-off, this/last month). Per person: **days present, absent, leave, times late, total late time, hours, OT**. Tap a person for a day-by-day list. CSV export for payroll. |
+| **Sync** | Batches of 50; per-record errors shown; a record edited during upload is not lost; photos upload after their record; admin changes made offline are queued (outbox). |
+| **Data accuracy** | Leading zeros kept (`0001` stays `0001`). Adjust form validates time format, prevents 2 records on one day, and stores the landowner ID together with the name. Audit log stores the real before → after values. |
+| **Performance** | Phones download only the last 60 days (configurable). Database setup runs once, not on every request. App opens from cache after 3.5 s on weak signal. |
+| **Themes** | 8 color themes: Coconut Green, Ocean Blue, Lagoon Teal, Sunset Orange, Royal Purple, Rose Pink, Copra Brown and **Sunlight Contrast** (for bright sun). Menu › Theme, or 🎨 on the login screen. Each user keeps their own theme on each phone. |
+| **Dark mode** | Works with every color theme (except Sunlight Contrast). One-tap 🌙/☀️ button in the top bar and on the login screen, or Menu › Theme › **Light / Dark / Auto** (Auto follows the phone's day/night setting). Remembered per user. Users who chose the old "Midnight Dark" theme are moved to Green + Dark automatically. |
+| **Profile photos** | Every user can set an avatar (tap the circle at the bottom of the menu, or Menu › My Profile Photo). Admins can set any user's photo on the User Accounts page. |
+| **Employee photos** | A photo is **required when registering a new employee** (camera or upload). Existing employees show a dashed circle until a photo is added – admins or their supervisor can tap it to add one. The photo appears on attendance cards, history, cut-off summary, and **at the top of the Time IN/OUT camera** so the supervisor can compare faces. |
+| **Admin** | Edit supervisors / landowners / locations, activate/deactivate users, create admin accounts, "Photo, GPS & Pay Rules" page, audit log from the server with search. |
 
 ---
 
-## 📁 Project File Structure
+## Upgrade from v2 (existing spreadsheet)
+
+1. **Back up** the spreadsheet (File › Make a copy).
+2. In Apps Script, replace all of `Code.gs` with the new one. Check **Project Settings › Time zone = (GMT+08:00) Manila**.
+3. **Deploy › Manage deployments › ✏ Edit › Version: New version › Deploy.** Google will ask for permission again — approve **Google Drive** (needed for photos). The Web App URL stays the same.
+4. Upload the new web files to GitHub, keeping this structure:
 
 ```text
-Attendance System/
-│
-├── index.html            # Main Single-Page Application (SPA) UI
-├── manifest.json         # PWA Manifest for installability on mobile/desktop
-├── sw.js                 # Service Worker for offline asset caching & sync
-├── Code.gs               # Google Apps Script Web App Backend & Sheets API
-├── README.md             # Setup, Deployment, and Testing Guide
-│
-├── css/
-│   └── styles.css        # Responsive Green & White theme, Mobile Bottom Nav, Desktop Sidebar
-│
-├── js/
-│   ├── db.js             # IndexedDB wrapper (attendance, employees, supervisors, users, etc.)
-│   ├── auth.js           # Web Crypto SHA-256 hashing, offline session management
-│   ├── sync.js           # Background & manual sync engine, connectivity monitoring
-│   └── app.js            # UI routing, GPS capture, Attendance recording, CSV Export
-│
-└── icons/
-    ├── logo-full.png         # CocoTrack logo with text (login screen)
-    ├── logo-emblem.png       # Round emblem (sidebar)
-    ├── favicon-64.png        # Browser tab icon
-    ├── apple-touch-icon.png  # iPhone home-screen icon
-    ├── app-icon-192/512.png, app-icon-maskable-192/512.png   # Android / PWA home-screen icons (emblem + COCOTRACK)
-    └── apple-touch-icon-v2.png  # iPhone home-screen icon
+index.html  manifest.json  sw.js
+css/styles.css
+js/db.js  js/api.js  js/auth.js  js/sync.js  js/camera.js  js/app.js
+icons/ (logo-full.png, logo-emblem.png, favicon-64.png, apple-touch-icon-v2.png,
+        app-icon-192.png, app-icon-512.png, app-icon-maskable-192.png, app-icon-maskable-512.png)
 ```
 
----
+> On GitHub the file names must be exact: `app.js`, not `app (1).js`. `Code.gs` is **not** uploaded to GitHub — it lives only in Apps Script.
 
-## 📊 Google Sheets Central Database Structure
+5. **Everyone signs in once with internet.** Old phone sessions don't have a token, so the app asks for a fresh login. Old passwords still work and are upgraded automatically on that login.
+6. **Before** the first online login on each phone, upload any PENDING records still on it with the v2 app (or keep the phone online so v3 uploads them after login — records are never deleted).
+7. Admin: open **Work Locations › Edit** and set the coordinates + radius for each block, then choose the rules under **Photo, GPS & Pay Rules**.
+8. Employee IDs that already lost their leading zeros in v2 (e.g. `1` instead of `0001`) must be fixed by hand in the Employees sheet (format the column as Plain text first).
 
-When Google Apps Script runs, it automatically creates and formats the following 7 sheets if they do not exist:
-
-1. **`Employees`**:
-   `[Employee ID, Employee Name, Position, Department, Supervisor ID, Supervisor Name, Landowner ID, Landowner Name, Location ID, Work Location, Employment Status, Date Enrolled]`
-   *Note: Employee ID is manually entered by Admin and strictly preserved with leading zeros as plain text (`@`). Daily workers are enrolled under a Supervisor and Work Location. The Landowner is not statically assigned to the worker; instead, the Supervisor selects the Landowner during login or when conducting area checking, dynamically stamping attendance punches with the checked landowner.*
-2. **`Supervisors`**:
-   `[Supervisor ID, Supervisor Name, Username, Password Hash, Account Status]`
-3. **`Landowners`**:
-   `[Landowner ID, Landowner Name, Location ID, Work Location, Supervisor ID, Status]`
-4. **`Work Locations`**:
-   `[Location ID, Work Location Name, Description, Landowner ID, Landowner Name, Supervisor ID, Status]`
-5. **`Attendance`**:
-   `[Attendance Record ID, Employee ID, Employee Name, Supervisor ID, Supervisor Name, Landowner ID, Landowner Name, Location ID, Work Location, Attendance Date, Time IN, Time OUT, Original Time IN, Original Time OUT, Adjusted By, Adjustment Reason, Actual GPS IN, Actual GPS OUT, Device Timestamp, Synchronization Date, Synchronization Status, Record Status, Attendance Type, Leave Type, Leave Remarks]`
-6. **`Audit Logs`**:
-   `[Log ID, User ID, User Role, Action, Record ID, Previous Value, New Value, Reason, Date and Time]`
-7. **`Users`**:
-   `[User ID, Username, Password Hash, Role, Linked Supervisor ID, Account Status, Last Login]`
+What the update changes in the spreadsheet automatically:
+- **Attendance**: new columns Photo IN, Photo OUT, Distance IN/OUT Meters, Geofence IN/OUT, Hours Worked, Overtime Hours, Clock Flag, Device Timestamp OUT.
+- **Work Locations**: Latitude, Longitude, Radius Meters.
+- **Users**: Salt, Must Change Password.
+- **Supervisors**: the Password Hash column is cleared (passwords now live only in Users, salted).
+- **Profile Photos** (new sheet): `Photo Key, Type (USER / EMPLOYEE), Owner ID, Image, Updated At, Updated By`. Photos are small (240×240 JPEG) and stored as text so phones can cache them for offline use. Only changed photos are downloaded at each sync.
 
 ---
 
-## 🚀 Setup & Deployment Instructions
+## New installation
 
-### Step 1: Create Google Spreadsheet & Deploy Google Apps Script
+1. Create a Google Sheet › **Extensions › Apps Script** › paste `Code.gs` › Save.
+2. **Deploy › New deployment › Web app**: Execute as **Me**, Who has access **Anyone** › Deploy › approve Sheets **and** Drive access › copy the URL ending in `/exec`.
+3. Host the web files (GitHub Pages works) and open `index.html`.
+4. **⚙ API Settings** › paste the URL › **Test Connection** (this creates all sheets) › Save.
+5. Sign in with `admin` / `admin123` › you'll be asked to set a new password.
 
-1. Open your web browser and go to [Google Sheets](https://sheets.new) to create a new blank Google Spreadsheet.
-2. Name the spreadsheet (e.g., `Employee Attendance Database`).
-3. In the top menu, click **Extensions** &gt; **Apps Script**.
-4. In the Apps Script code editor, delete any code inside `Code.gs` and copy-paste the entire contents of `Code.gs` from this project.
-5. Save the project (click the disk icon or press `Ctrl + S`).
-6. Deploy the Web App:
-   - Click the blue **Deploy** button (top right) &gt; **New deployment**.
-   - Click the gear icon next to *Select type* and choose **Web app**.
-   - Configure the following settings:
-     - **Description**: `Attendance API v1`
-     - **Execute as**: `Me (your email address)`
-     - **Who has access**: `Anyone` *(Crucial: allows the offline/mobile client app to submit records without OAuth login popups)*.
-   - Click **Deploy**.
-   - If prompted, click **Authorize access**, choose your Google account, click **Advanced**, and click **Go to Untitled project (unsafe)** to grant spreadsheet access.
-   - Copy the generated **Web App URL** (it ends with `/exec`).
-
-> **Updating an existing deployment?** Paste the new `Code.gs`, click **Deploy > Manage deployments > (pencil) Edit > Version: New version > Deploy**. The Web App URL stays the same. The three new Attendance columns are added to your existing sheet automatically on the next request, and existing data is kept. Also check **Project Settings > Time zone = (GMT+08:00) Manila**.
-
-### Step 2: Connect the Frontend Application to Google Sheets
-
-1. Open `index.html` in your web browser (or serve it via a local web server or web host).
-2. On the login screen or top-right header, click **⚙ API Settings** (or the gear icon).
-3. Paste the **Google Apps Script Web App URL** into the field.
-4. Click **🔌 Test Connection & Initialize Sheets**.
-   - The system will connect to Google Apps Script, initialize all 7 sheets with green headers, and confirm connectivity!
-5. Click **Save Settings**.
+"Anyone" access is required so phones can reach the API without a Google login popup. It is safe in v3 because every action except PING and LOGIN needs a valid session token.
 
 ---
 
-## 🔑 Initial Default Login Credentials
+## How a Time IN works
 
-Upon first initialization, the system creates a default Administrator account:
+1. Supervisor picks the **landowner area** they are checking.
+2. Taps **TIME IN** on a worker → the phone gets a **fresh GPS** reading.
+3. Geofence rule: inside ✓ / outside → warn or block (admin setting).
+4. **Live camera** opens → take the photo → review → **Use Photo**. The watermark is burned into the image.
+5. The record and photo are saved on the phone (PENDING) and upload automatically when there is signal: record first, then photo to Drive. The Drive link is written into the Attendance row.
+6. Full-size photos are removed from the phone 3 days after upload (a thumbnail stays). The original is always in Drive.
 
-- **Username**: `admin`
-- **Password**: `admin123`
-- **Role**: `Admin`
-
-*Tip: After logging in, you can change your password or create additional supervisors and admins in the **User Accounts** menu.*
-
----
-
-## 📱 How to Use as an Installable Mobile / Desktop Web App (PWA)
-
-This system is built as a Progressive Web App (PWA) and does not require an App Store or Play Store account:
-
-### On Android (Chrome / Edge):
-1. Open the application URL in Google Chrome.
-2. Tap the three dots menu (⋮) in the top-right corner.
-3. Tap **Install app** or **Add to Home screen**.
-4. An icon will appear on your device's home screen that opens in full-screen standalone mode without browser bars!
-
-### On iPhone / iPad (Safari):
-1. Open the application URL in Safari.
-2. Tap the **Share** button (box with an upward arrow at the bottom).
-3. Scroll down and tap **Add to Home Screen**.
-4. Tap **Add**. The app will launch like a native iOS application.
-
-### On Desktop (Windows / Mac / Linux):
-1. Open in Google Chrome or Microsoft Edge.
-2. Click the **Install** icon on the right side of the URL address bar.
-3. The app opens in its own clean desktop window.
+If the browser can't open the live camera, the phone camera app is used instead and the watermark says **Source: FILE**, so reviewers know.
 
 ---
 
-## 🧪 Testing Offline Functionality
+## Admin settings ("Photo, GPS & Pay Rules")
 
-You can thoroughly verify offline behavior right from your browser's Developer Tools:
-
-1. **Log in online once**:
-   - Log in with `admin` / `admin123` or a supervisor account while connected.
-   - The app automatically caches credentials, employee assignments, and static files into IndexedDB and Cache Storage.
-2. **Simulate Offline Mode**:
-   - Open Developer Tools (`F12` or right-click &gt; *Inspect*).
-   - Go to the **Network** tab.
-   - In the throttling dropdown (where it says *No throttling*), select **Offline**.
-3. **Record Attendance Offline**:
-   - Notice the connection pill switches to **Offline** (Red).
-   - Go to **Record Attendance**.
-   - Click **TIME IN** for an employee.
-   - The attendance punch is recorded instantly with the exact device timestamp and GPS coordinates.
-   - Notice the sync badge displays **PENDING** (Orange).
-4. **Log Out & Log In Offline**:
-   - Click the logout button.
-   - Notice you are still on the login page even with no internet!
-   - Enter your credentials and click **Sign In**.
-   - The app verifies your password hash against IndexedDB and logs you in offline!
-5. **Simulate Online Reconnection**:
-   - In the Developer Tools Network tab, switch back from **Offline** to **No throttling** (Online).
-   - Watch the connection badge immediately turn green (**Online**).
-   - The system detects reconnection and **automatically uploads pending records to Google Sheets**!
-   - The badge turns green (**SYNCED**) and Google Sheets receives the new rows with zero duplicates.
+| Setting | Default |
+|---|---|
+| Photo | Required (options: Optional with Skip button, Off) |
+| Geofence | Warn & flag (options: Block, Off) |
+| Default radius | 300 m |
+| Weak GPS above | 100 m accuracy |
+| Work starts at / grace period (for "late") | 07:00 AM / 0 min |
+| Regular hours / break / break after | 8 h / 60 min / 5 h |
+| Rest day | Sunday |
+| Attendance days kept on phones | 60 |
+| Offline login allowed for | 30 days after last online login |
+| Phone clock tolerance | 5 minutes |
 
 ---
 
-## 🛡 Security & Role-Based Rules
+## Cut-off summary rules
 
-- **Client-Side Storage**: Sensitive passwords are never stored in plaintext; they are hashed with **SHA-256** using the browser's native Web Crypto API.
-- **Strict Supervisor Isolation**: When a supervisor logs in, both the client queries and backend Google Apps Script filter employees and attendance exclusively by that supervisor's ID.
-- **Audit Logging**: Every attendance adjustment, employee reassignment, or record soft deletion records an immutable audit entry with the editor's identity, timestamp, and reason.
+- **Present** = a day with a Time IN.
+- **Late** = Time IN after *Work starts at* + *grace period*. Late time is counted from *Work starts at* (grace 15 → 07:15 is on time, 07:16 is 16 min late).
+- **Absent** = a working day (up to today) with no Time IN and no leave. The rest day and days before the employee's *Date Enrolled* are not counted.
+- **Leave** = days marked On Leave.
+- Online, the summary reads the full range from Google Sheets (any dates). Offline, it uses only the records on the phone and shows a warning.
+
+## Google Sheets structure
+
+1. **Employees** — `Employee ID, Employee Name, Position, Department, Supervisor ID, Supervisor Name, Landowner ID, Landowner Name, Location ID, Work Location, Employment Status, Date Enrolled`
+2. **Supervisors** — `Supervisor ID, Supervisor Name, Username, Password Hash (empty), Account Status`
+3. **Landowners** — `Landowner ID, Landowner Name, Location ID, Work Location, Supervisor ID, Status`
+4. **Work Locations** — `… Status, Latitude, Longitude, Radius Meters`
+5. **Attendance** — v2 columns + `Photo IN, Photo OUT, Distance IN Meters, Distance OUT Meters, Geofence IN, Geofence OUT, Hours Worked, Overtime Hours, Clock Flag, Device Timestamp OUT`
+6. **Audit Logs** — `Log ID, User ID, User Role, Action, Record ID, Previous Value, New Value, Reason, Date and Time`
+7. **Users** — `User ID, Username, Password Hash, Role, Linked Supervisor ID, Account Status, Last Login, Salt, Must Change Password`
+
+Sessions and settings are stored in Apps Script **Script Properties** (not in the sheet).
+
+---
+
+## Security notes
+
+- Passwords: the phone sends SHA-256(password); the server stores `salt + 500× SHA-256`. The offline copy on the phone is PBKDF2 (150,000 rounds) with its own salt.
+- Supervisors only receive and can only change their own employees' records and photos (checked on the server).
+- Photos in Drive stay **private** to the script owner. The app shows them through the API, so you don't need to share Drive links.
+- Anyone with edit access to the spreadsheet can still change data directly. Keep sheet sharing limited to admins.
+
+---
+
+## Testing offline
+
+1. Sign in online once, open **Record Attendance**.
+2. DevTools › Network › **Offline**. Do a Time IN (camera + GPS still work).
+3. The card shows **PENDING** and the Sync button shows a counter.
+4. Switch back online: the record and then the photo upload automatically.
